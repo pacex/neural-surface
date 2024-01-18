@@ -106,6 +106,9 @@ __global__ void eval_image(uint32_t n_elements, cudaTextureObject_t texture, flo
 
 // Generate training data
 
+#define N_INPUT_DIMS 6;
+#define N_OUTPUT_DIMS 3;
+
 __global__ void setup_kernel(uint32_t n_elements, curandState* state) {
 
 	int idx = threadIdx.x + blockDim.x * blockIdx.x;
@@ -119,8 +122,7 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 	if (idx >= n_elements)
 		return;
 
-	int result_stride = 6;
-	int output_idx = idx * result_stride;
+	int output_idx = idx * N_INPUT_DIMS;
 
 	// Pick random face
 	// TODO: weight by face area
@@ -132,13 +134,16 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 	iv1 = indices[3 * faceId + 0].vertex_index;
 	iv2 = indices[3 * faceId + 1].vertex_index;
 	iv3 = indices[3 * faceId + 2].vertex_index;
+	assert(iv1 == indices[3 * faceId + 0].texcoord_index);
+	assert(iv2 == indices[3 * faceId + 1].texcoord_index);
+	assert(iv3 == indices[3 * faceId + 2].texcoord_index);
 
 	result[output_idx + 0] = (float)iv1;
 	result[output_idx + 1] = (float)iv2;
 	result[output_idx + 2] = (float)iv3;
 
 	float alpha, beta, gamma; // Barycentric coordinates
-	// TODO is this actually uniform??
+	// TODO: is this actually uniform??
 	alpha = curand_uniform(crs + idx);
 	beta = curand_uniform(crs + idx) * (1.0f - alpha);
 	gamma = 1.0f - alpha - beta;
@@ -146,6 +151,39 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 	result[output_idx + 3] = alpha;
 	result[output_idx + 4] = beta;
 	result[output_idx + 5] = gamma;
+}
+
+__global__ void generate_training_target(uint32_t n_elements, cudaTextureObject_t texture, float* training_batch, float* texcoords, float* result) {
+
+	int idx = threadIdx.x + blockDim.x * blockIdx.x;
+
+	if (idx >= n_elements)
+		return;
+
+	int input_idx = idx * N_INPUT_DIMS;
+	int output_idx = idx * N_OUTPUT_DIMS;
+
+	int iv1, iv2, iv3;
+	float w1, w2, w3;
+	iv1 = (int)training_batch[input_idx + 0];
+	iv2 = (int)training_batch[input_idx + 1];
+	iv3 = (int)training_batch[input_idx + 2];
+	w1 = training_batch[input_idx + 3];
+	w2 = training_batch[input_idx + 4];
+	w3 = training_batch[input_idx + 5];
+
+	vec2 uv1, uv2, uv3;
+	uv1 = vec2(texcoords[2 * iv1 + 0], texcoords[2 * iv1 + 1]);
+	uv2 = vec2(texcoords[2 * iv2 + 0], texcoords[2 * iv2 + 1]);
+	uv3 = vec2(texcoords[2 * iv3 + 0], texcoords[2 * iv3 + 1]);
+
+	vec2 uv_interp = w1 * uv1 + w2 * uv2 + w3 * uv3;
+
+	float4 val = tex2D<float4>(texture, uv_interp.x, uv_interp.y);
+	result[output_idx + 0] = val.x;
+	result[output_idx + 1] = val.y;
+	result[output_idx + 2] = val.z;
+
 }
 
 int main(int argc, char* argv[]) {
@@ -322,6 +360,7 @@ int main(int argc, char* argv[]) {
 		GPUMatrix<float> training_batch(n_input_dims, batch_size);
 
 		GPUMatrix<float> training_batch_obj(6, batch_size);
+		GPUMatrix<float> training_target_obj(3, batch_size);
 
 		// Auxiliary matrices for evaluation
 		GPUMatrix<float> prediction(n_output_dims, n_coords_padded);
@@ -360,8 +399,12 @@ int main(int argc, char* argv[]) {
 				cudaMalloc(&crs, sizeof(curandState) * batch_size);
 				linear_kernel(setup_kernel, 0, nullptr, batch_size, crs);
 				linear_kernel(generate_face_positions, 0, nullptr, batch_size, n_faces, crs, indices.data(), vertices.data(), training_batch_obj.data());
+				linear_kernel(generate_training_target, 0, nullptr, batch_size, texture, training_batch_obj.data(), texcoords.data(), training_target_obj.data());
 
-				std::vector<float> test = training_batch_obj.to_cpu_vector();
+				cudaFree(crs);
+
+				std::vector<float> in = training_batch_obj.to_cpu_vector();
+				std::vector<float> out = training_target_obj.to_cpu_vector();
 			}
 
 			// Training step
