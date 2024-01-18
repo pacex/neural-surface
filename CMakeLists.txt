@@ -284,3 +284,5 @@ endif()
 if (TCNN_BUILD_BENCHMARK)
 	add_subdirectory("benchmarks/image")
 endif()
+
+add_subdirectory("neural_surface")

@@ -11,7 +11,7 @@
 		"l2_reg": 1e-8
 	},
 	"encoding": {
-		"otype": "OneBlob",
+		"otype": "Identity",
 		"n_bins": 64
 	},
 	"network": {
