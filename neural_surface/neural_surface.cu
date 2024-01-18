@@ -43,6 +43,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <curand.h>
+#include <curand_kernel.h>
+#include <math.h>
 
 #define TINYOBJLOADER_IMPLEMENTATION
 #include "tiny_obj_loader.h"
@@ -99,6 +102,50 @@ __global__ void eval_image(uint32_t n_elements, cudaTextureObject_t texture, flo
 	for (uint32_t i = 3; i < stride; ++i) {
 		result[output_idx + i] = 1;
 	}
+}
+
+// Generate training data
+
+__global__ void setup_kernel(uint32_t n_elements, curandState* state) {
+
+	int idx = threadIdx.x + blockDim.x * blockIdx.x;
+	curand_init(1337, idx, 0, &state[idx]);
+}
+
+__global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, curandState* crs, tinyobj::index_t* indices, float* vertices, float* result) {
+
+	int idx = threadIdx.x + blockDim.x * blockIdx.x;
+
+	if (idx >= n_elements)
+		return;
+
+	int result_stride = 6;
+	int output_idx = idx * result_stride;
+
+	// Pick random face
+	// TODO: weight by face area
+	float r = fmodf(curand_uniform(crs + idx), 1.0f);
+	r *= n_faces - 1.f;
+	int faceId = (int)r;
+
+	int iv1, iv2, iv3; // Indices of adjacent vertices
+	iv1 = indices[3 * faceId + 0].vertex_index;
+	iv2 = indices[3 * faceId + 1].vertex_index;
+	iv3 = indices[3 * faceId + 2].vertex_index;
+
+	result[output_idx + 0] = (float)iv1;
+	result[output_idx + 1] = (float)iv2;
+	result[output_idx + 2] = (float)iv3;
+
+	float alpha, beta, gamma; // Barycentric coordinates
+	// TODO is this actually uniform??
+	alpha = curand_uniform(crs + idx);
+	beta = curand_uniform(crs + idx) * (1.0f - alpha);
+	gamma = 1.0f - alpha - beta;
+
+	result[output_idx + 3] = alpha;
+	result[output_idx + 4] = beta;
+	result[output_idx + 5] = gamma;
 }
 
 int main(int argc, char* argv[]) {
@@ -162,9 +209,7 @@ int main(int argc, char* argv[]) {
 		int width, height;
 		GPUMemory<float> image = load_image(argv[1], width, height);
 
-		///////////////////////////////////////////////////////////////////////
 		// Parse the OBJ file using tinyobj
-		///////////////////////////////////////////////////////////////////////
 		std::string path = "data/objects/wheatley.obj";
 
 		std::cout << "Loading " << path << "..." << std::flush;
@@ -179,10 +224,31 @@ int main(int argc, char* argv[]) {
 		{ // `err` may contain warning message.
 			std::cerr << err << std::endl;
 		}
+		if (!warn.empty())
+		{
+			std::cerr << warn << std::endl;
+		}
 		if (!ret)
 		{
+			std::cerr << "Loading .obj file failed." << std::endl;
 			exit(1);
 		}
+
+		int shapeIndex = 1;
+		int n_vertices = attrib.vertices.size() / 3;
+		assert(n_vertices == attrib.texcoords.size() / 2);
+
+		int n_indices = shapes[shapeIndex].mesh.indices.size();
+		int n_faces = n_indices / 3;
+
+		// write vertices and indices to GPU memory
+		GPUMemory<float> vertices(n_vertices * 3);
+		vertices.copy_from_host(attrib.vertices);
+		GPUMemory<float> texcoords(n_vertices * 2);
+		texcoords.copy_from_host(attrib.texcoords);
+
+		GPUMemory<tinyobj::index_t> indices(n_indices);
+		indices.copy_from_host(shapes[shapeIndex].mesh.indices);
 
 		// Second step: create a cuda texture out of this image. It'll be used to generate training data efficiently on the fly
 		cudaResourceDesc resDesc;
@@ -250,9 +316,12 @@ int main(int argc, char* argv[]) {
 
 		default_rng_t rng{1337};
 
+
 		// Auxiliary matrices for training
 		GPUMatrix<float> training_target(n_output_dims, batch_size);
 		GPUMatrix<float> training_batch(n_input_dims, batch_size);
+
+		GPUMatrix<float> training_batch_obj(6, batch_size);
 
 		// Auxiliary matrices for evaluation
 		GPUMatrix<float> prediction(n_output_dims, n_coords_padded);
@@ -286,6 +355,13 @@ int main(int argc, char* argv[]) {
 			{
 				generate_random_uniform<float>(training_stream, rng, batch_size * n_input_dims, training_batch.data());
 				linear_kernel(eval_image<n_output_dims>, 0, training_stream, batch_size, texture, training_batch.data(), training_target.data());
+
+				curandState* crs;
+				cudaMalloc(&crs, sizeof(curandState) * batch_size);
+				linear_kernel(setup_kernel, 0, nullptr, batch_size, crs);
+				linear_kernel(generate_face_positions, 0, nullptr, batch_size, n_faces, crs, indices.data(), vertices.data(), training_batch_obj.data());
+
+				std::vector<float> test = training_batch_obj.to_cpu_vector();
 			}
 
 			// Training step
