@@ -109,10 +109,10 @@ __global__ void eval_image(uint32_t n_elements, cudaTextureObject_t texture, flo
 #define N_INPUT_DIMS 6;
 #define N_OUTPUT_DIMS 3;
 
-__global__ void setup_kernel(uint32_t n_elements, curandState* state) {
+__global__ void setup_kernel(uint32_t n_elements, curandState* state, int iter) {
 
 	int idx = threadIdx.x + blockDim.x * blockIdx.x;
-	curand_init(1337, idx, 0, &state[idx]);
+	curand_init(1337 + iter, idx, 0, &state[idx]);
 }
 
 __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, curandState* crs, tinyobj::index_t* indices, float* vertices, float* result) {
@@ -220,8 +220,7 @@ int main(int argc, char* argv[]) {
 				{"frobenius_normalization", true},
 			}},
 			{"encoding", {
-				{"otype", "OneBlob"},
-				{"n_bins", 32},
+				{"otype", "Frequency"},
 			}},
 			{"network", {
 				{"otype", "FullyFusedMLP"},
@@ -239,15 +238,11 @@ int main(int argc, char* argv[]) {
 			config = json::parse(f, nullptr, true, /*skip_comments=*/true);
 		}
 
-		/*
-		* First step :
-			- load texture that we would like to learn
-			- load model to generate training inputs
-		*/ 
-		int width, height;
-		GPUMemory<float> image = load_image(argv[1], width, height);
+		/* ======================
+		*  === LOAD .OBJ FILE ===
+		*  ======================
+		*/
 
-		// Parse the OBJ file using tinyobj
 		std::string path = "data/objects/wheatley.obj";
 
 		std::cout << "Loading " << path << "..." << std::flush;
@@ -288,6 +283,14 @@ int main(int argc, char* argv[]) {
 		GPUMemory<tinyobj::index_t> indices(n_indices);
 		indices.copy_from_host(shapes[shapeIndex].mesh.indices);
 
+		/* ==============================
+		*  === LOAD REFERENCE TEXTURE ===
+		*  ==============================
+		*/
+
+		int width, height;
+		GPUMemory<float> image = load_image(argv[1], width, height);
+
 		// Second step: create a cuda texture out of this image. It'll be used to generate training data efficiently on the fly
 		cudaResourceDesc resDesc;
 		memset(&resDesc, 0, sizeof(resDesc));
@@ -309,22 +312,24 @@ int main(int argc, char* argv[]) {
 		cudaTextureObject_t texture;
 		CUDA_CHECK_THROW(cudaCreateTextureObject(&texture, &resDesc, &texDesc, nullptr));
 
+
 		// Third step: sample a reference image to dump to disk. Visual comparison of this reference image and the learned
 		//             function will be eventually possible.
 
-		int sampling_width = width;
-		int sampling_height = height;
+		//int sampling_width = width;
+		//int sampling_height = height;
 
 		// Uncomment to fix the resolution of the training task independent of input image
 		// int sampling_width = 1024;
 		// int sampling_height = 1024;
 
-		uint32_t n_coords = sampling_width * sampling_height;
-		uint32_t n_coords_padded = next_multiple(n_coords, BATCH_SIZE_GRANULARITY);
+		//uint32_t n_coords = sampling_width * sampling_height;
+		//uint32_t n_coords_padded = next_multiple(n_coords, BATCH_SIZE_GRANULARITY);
 
-		GPUMemory<float> sampled_image(n_coords * 3);
-		GPUMemory<float> xs_and_ys(n_coords_padded * 2);
+		//GPUMemory<float> sampled_image(n_coords * 3);
+		//GPUMemory<float> xs_and_ys(n_coords_padded * 2);
 
+		/*
 		std::vector<float> host_xs_and_ys(n_coords * 2);
 		for (int y = 0; y < sampling_height; ++y) {
 			for (int x = 0; x < sampling_width; ++x) {
@@ -339,43 +344,43 @@ int main(int argc, char* argv[]) {
 		linear_kernel(eval_image<3>, 0, nullptr, n_coords, texture, xs_and_ys.data(), sampled_image.data());
 
 		save_image(sampled_image.data(), sampling_width, sampling_height, 3, 3, "reference.jpg");
+		*/
 
-		// Fourth step: train the model by sampling the above image and optimizing an error metric
+		/* =======================
+		*  === TRAIN THE MODEL ===
+		*  =======================
+		*/
 
 		// Various constants for the network and optimization
 		const uint32_t batch_size = 1 << 18;
 		const uint32_t n_training_steps = argc >= 4 ? atoi(argv[3]) : 10000000;
-		const uint32_t n_input_dims = 2; // 2-D image coordinate
-		const uint32_t n_output_dims = 3; // RGB color
+		const uint32_t n_input_dims = N_INPUT_DIMS; // (v1, v2, v3, alpha, beta, gamma)
+		const uint32_t n_output_dims = N_OUTPUT_DIMS; // RGB color
 
 		cudaStream_t inference_stream;
 		CUDA_CHECK_THROW(cudaStreamCreate(&inference_stream));
 		cudaStream_t training_stream = inference_stream;
 
 		default_rng_t rng{1337};
-
-
 		// Auxiliary matrices for training
-		GPUMatrix<float> training_target(n_output_dims, batch_size);
-		GPUMatrix<float> training_batch(n_input_dims, batch_size);
 
-		GPUMatrix<float> training_batch_obj(6, batch_size);
-		GPUMatrix<float> training_target_obj(3, batch_size);
+		GPUMatrix<float> training_batch(n_input_dims, batch_size);
+		GPUMatrix<float> training_target(n_output_dims, batch_size);
 
 		// Auxiliary matrices for evaluation
-		GPUMatrix<float> prediction(n_output_dims, n_coords_padded);
-		GPUMatrix<float> inference_batch(xs_and_ys.data(), n_input_dims, n_coords_padded);
+		//GPUMatrix<float> prediction(n_output_dims, n_coords_padded);
+		//GPUMatrix<float> inference_batch(xs_and_ys.data(), n_input_dims, n_coords_padded);
 
 		json encoding_opts = config.value("encoding", json::object());
 		json loss_opts = config.value("loss", json::object());
 		json optimizer_opts = config.value("optimizer", json::object());
 		json network_opts = config.value("network", json::object());
 
-		std::shared_ptr<Loss<precision_t>> loss{create_loss<precision_t>(loss_opts)};
-		std::shared_ptr<Optimizer<precision_t>> optimizer{create_optimizer<precision_t>(optimizer_opts)};
+		std::shared_ptr<Loss<precision_t>> loss{ create_loss<precision_t>(loss_opts) };
+		std::shared_ptr<Optimizer<precision_t>> optimizer{ create_optimizer<precision_t>(optimizer_opts) };
 		std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(n_input_dims, n_output_dims, encoding_opts, network_opts);
 
-		auto trainer = std::make_shared<Trainer<float, precision_t, precision_t>>(network, optimizer, loss);
+		auto model = std::make_shared<Trainer<float, precision_t, precision_t>>(network, optimizer, loss);
 
 		std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
 
@@ -390,49 +395,67 @@ int main(int argc, char* argv[]) {
 			bool print_loss = i % interval == 0;
 			bool visualize_learned_func = argc < 5 && i % interval == 0;
 
-			// Compute reference values at random coordinates
+			/* ===============================
+			*  === GENERATE TRAINING BATCH ===
+			*  ===============================
+			*/
 			{
-				generate_random_uniform<float>(training_stream, rng, batch_size * n_input_dims, training_batch.data());
-				linear_kernel(eval_image<n_output_dims>, 0, training_stream, batch_size, texture, training_batch.data(), training_target.data());
-
+				// RNG
 				curandState* crs;
 				cudaMalloc(&crs, sizeof(curandState) * batch_size);
-				linear_kernel(setup_kernel, 0, nullptr, batch_size, crs);
-				linear_kernel(generate_face_positions, 0, nullptr, batch_size, n_faces, crs, indices.data(), vertices.data(), training_batch_obj.data());
-				linear_kernel(generate_training_target, 0, nullptr, batch_size, texture, training_batch_obj.data(), texcoords.data(), training_target_obj.data());
+				linear_kernel(setup_kernel, 0, training_stream, batch_size, crs, i);
+
+				// Generate Surface Points - training input
+				linear_kernel(generate_face_positions, 0, training_stream, batch_size, n_faces, crs, indices.data(), vertices.data(), training_batch.data());
+
+				// Sample reference texture at surface points - training output
+				linear_kernel(generate_training_target, 0, training_stream, batch_size, texture, training_batch.data(), texcoords.data(), training_target.data());
 
 				cudaFree(crs);
 
-				std::vector<float> in = training_batch_obj.to_cpu_vector();
-				std::vector<float> out = training_target_obj.to_cpu_vector();
+				// Debug
+				//std::vector<float> in = training_batch_obj.to_cpu_vector();
+				//std::vector<float> out = training_target_obj.to_cpu_vector();
 			}
 
-			// Training step
+			/* =========================
+			*  === RUN TRAINING STEP ===
+			*  =========================
+			*/
+
 			{
-				auto ctx = trainer->training_step(training_stream, training_batch, training_target);
+				//auto ctx = trainer->training_step(training_stream, training_batch, training_target);
+
+				auto ctx_obj = model->training_step(training_stream, training_batch, training_target);
+
+				std::cout << "Step#" << i << ": " << "loss=" << model->loss(training_stream, *ctx_obj) << std::endl;
 
 				if (i % std::min(interval, (uint32_t)100) == 0) {
-					tmp_loss += trainer->loss(training_stream, *ctx);
+					tmp_loss += model->loss(training_stream, *ctx_obj);
 					++tmp_loss_counter;
 				}
 			}
 
+
+
+
 			// Debug outputs
 			{
+				/*
 				if (print_loss) {
 					std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
 					std::cout << "Step#" << i << ": " << "loss=" << tmp_loss/(float)tmp_loss_counter << " time=" << std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count() << "[µs]" << std::endl;
 
 					tmp_loss = 0;
 					tmp_loss_counter = 0;
-				}
+				}*/
 
 				if (visualize_learned_func) {
-					network->inference(inference_stream, inference_batch, prediction);
-					auto filename = fmt::format("{}.jpg", i);
-					std::cout << "Writing '" << filename << "'... ";
-					save_image(prediction.data(), sampling_width, sampling_height, 3, n_output_dims, filename);
-					std::cout << "done." << std::endl;
+					//network->inference(inference_stream, inference_batch, prediction);
+					//auto filename = fmt::format("{}.jpg", i);
+					//std::cout << "Writing '" << filename << "'... ";
+					//save_image(prediction.data(), sampling_width, sampling_height, 3, n_output_dims, filename);
+					//std::cout << "done." << std::endl;
 				}
 
 				// Don't count visualizing as part of timing
@@ -449,8 +472,8 @@ int main(int argc, char* argv[]) {
 
 		// Dump final image if a name was specified
 		if (argc >= 5) {
-			network->inference(inference_stream, inference_batch, prediction);
-			save_image(prediction.data(), sampling_width, sampling_height, 3, n_output_dims, argv[4]);
+			//network->inference(inference_stream, inference_batch, prediction);
+			//save_image(prediction.data(), sampling_width, sampling_height, 3, n_output_dims, argv[4]);
 		}
 
 		free_all_gpu_memory_arenas();
