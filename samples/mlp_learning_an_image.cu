@@ -132,14 +132,13 @@ int main(int argc, char* argv[]) {
 				{"frobenius_normalization", true},
 			}},
 			{"encoding", {
-				{"otype", "OneBlob"},
-				{"n_bins", 32},
+				{"otype", "Frequency"},
 			}},
 			{"network", {
 				{"otype", "FullyFusedMLP"},
 				// {"otype", "CutlassMLP"},
 				{"n_neurons", 64},
-				{"n_hidden_layers", 4},
+				{"n_hidden_layers", 2},
 				{"activation", "ReLU"},
 				{"output_activation", "None"},
 			}},

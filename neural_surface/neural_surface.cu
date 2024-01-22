@@ -106,7 +106,7 @@ __global__ void eval_image(uint32_t n_elements, cudaTextureObject_t texture, flo
 
 // Generate training data
 
-#define N_INPUT_DIMS 6;
+#define N_INPUT_DIMS 3;
 #define N_OUTPUT_DIMS 3;
 
 __global__ void setup_kernel(uint32_t n_elements, curandState* state, int iter) {
@@ -138,9 +138,10 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 	assert(iv2 == indices[3 * faceId + 1].texcoord_index);
 	assert(iv3 == indices[3 * faceId + 2].texcoord_index);
 
-	result[output_idx + 0] = (float)iv1;
-	result[output_idx + 1] = (float)iv2;
-	result[output_idx + 2] = (float)iv3;
+	result[output_idx + 0] = (float)faceId;
+	//result[output_idx + 0] = (float)iv1;
+	//result[output_idx + 1] = (float)iv2;
+	//result[output_idx + 2] = (float)iv3;
 
 	float alpha, beta, gamma; // Barycentric coordinates
 	// TODO: is this actually uniform??
@@ -148,12 +149,31 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 	beta = curand_uniform(crs + idx) * (1.0f - alpha);
 	gamma = 1.0f - alpha - beta;
 
-	result[output_idx + 3] = alpha;
-	result[output_idx + 4] = beta;
-	result[output_idx + 5] = gamma;
+
+	result[output_idx + 1] = alpha;
+	result[output_idx + 2] = beta;
+	//result[output_idx + 3] = alpha;
+	//result[output_idx + 4] = beta;
+	//result[output_idx + 5] = gamma;
 }
 
-__global__ void generate_training_target(uint32_t n_elements, cudaTextureObject_t texture, float* training_batch, float* texcoords, float* result) {
+__global__ void rescale_faceIds(uint32_t n_elements, uint32_t n_faces, float* training_batch, float* result) {
+
+	int idx = threadIdx.x + blockDim.x * blockIdx.x;
+
+	if (idx >= n_elements)
+		return;
+
+	int input_idx = idx * N_INPUT_DIMS;
+	int output_idx = idx * N_INPUT_DIMS;
+
+	float scale = 1.0f / (float)n_faces;
+
+	result[input_idx + 0] = training_batch[output_idx + 0] * scale;
+
+}
+
+__global__ void generate_training_target(uint32_t n_elements, cudaTextureObject_t texture, float* training_batch, tinyobj::index_t* indices, float* texcoords, float* result) {
 
 	int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
@@ -163,14 +183,23 @@ __global__ void generate_training_target(uint32_t n_elements, cudaTextureObject_
 	int input_idx = idx * N_INPUT_DIMS;
 	int output_idx = idx * N_OUTPUT_DIMS;
 
-	int iv1, iv2, iv3;
+	int iv1, iv2, iv3, faceId;
 	float w1, w2, w3;
-	iv1 = (int)training_batch[input_idx + 0];
-	iv2 = (int)training_batch[input_idx + 1];
-	iv3 = (int)training_batch[input_idx + 2];
-	w1 = training_batch[input_idx + 3];
-	w2 = training_batch[input_idx + 4];
-	w3 = training_batch[input_idx + 5];
+	//iv1 = (int)training_batch[input_idx + 0];
+	//iv2 = (int)training_batch[input_idx + 1];
+	//iv3 = (int)training_batch[input_idx + 2];
+	//w1 = training_batch[input_idx + 3];
+	//w2 = training_batch[input_idx + 4];
+	//w3 = training_batch[input_idx + 5];
+
+	faceId = training_batch[input_idx + 0];
+	iv1 = indices[3 * faceId + 0].texcoord_index;
+	iv2 = indices[3 * faceId + 1].texcoord_index;
+	iv3 = indices[3 * faceId + 2].texcoord_index;
+
+	w1 = training_batch[input_idx + 1];
+	w2 = training_batch[input_idx + 2];
+	w3 = 1.0f - w1 - w2;
 
 	vec2 uv1, uv2, uv3;
 	uv1 = vec2(texcoords[2 * iv1 + 0], texcoords[2 * iv1 + 1]);
@@ -220,7 +249,12 @@ int main(int argc, char* argv[]) {
 				{"frobenius_normalization", true},
 			}},
 			{"encoding", {
-				{"otype", "Frequency"},
+				{"otype", "HashGrid"},
+				{"n_levels", 16},
+				{"n_features_per_level", 2},
+				{"log2_hashmap_size", 15},
+				{"base_resolution", 16},
+				{"per_level_scale", 1.5},
 			}},
 			{"network", {
 				{"otype", "FullyFusedMLP"},
@@ -364,6 +398,7 @@ int main(int argc, char* argv[]) {
 		default_rng_t rng{1337};
 		// Auxiliary matrices for training
 
+		GPUMatrix<float> training_batch_raw(n_input_dims, batch_size);
 		GPUMatrix<float> training_batch(n_input_dims, batch_size);
 		GPUMatrix<float> training_target(n_output_dims, batch_size);
 
@@ -406,10 +441,11 @@ int main(int argc, char* argv[]) {
 				linear_kernel(setup_kernel, 0, training_stream, batch_size, crs, i);
 
 				// Generate Surface Points - training input
-				linear_kernel(generate_face_positions, 0, training_stream, batch_size, n_faces, crs, indices.data(), vertices.data(), training_batch.data());
+				linear_kernel(generate_face_positions, 0, training_stream, batch_size, n_faces, crs, indices.data(), vertices.data(), training_batch_raw.data());
+				linear_kernel(rescale_faceIds, 0, training_stream, batch_size, n_faces, training_batch_raw.data(), training_batch.data());
 
 				// Sample reference texture at surface points - training output
-				linear_kernel(generate_training_target, 0, training_stream, batch_size, texture, training_batch.data(), texcoords.data(), training_target.data());
+				linear_kernel(generate_training_target, 0, training_stream, batch_size, texture, training_batch_raw.data(), indices.data(), texcoords.data(), training_target.data());
 
 				cudaFree(crs);
 
@@ -428,8 +464,6 @@ int main(int argc, char* argv[]) {
 
 				auto ctx_obj = model->training_step(training_stream, training_batch, training_target);
 
-				std::cout << "Step#" << i << ": " << "loss=" << model->loss(training_stream, *ctx_obj) << std::endl;
-
 				if (i % std::min(interval, (uint32_t)100) == 0) {
 					tmp_loss += model->loss(training_stream, *ctx_obj);
 					++tmp_loss_counter;
@@ -441,14 +475,14 @@ int main(int argc, char* argv[]) {
 
 			// Debug outputs
 			{
-				/*
+				
 				if (print_loss) {
 					std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
 					std::cout << "Step#" << i << ": " << "loss=" << tmp_loss/(float)tmp_loss_counter << " time=" << std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count() << "[µs]" << std::endl;
 
 					tmp_loss = 0;
 					tmp_loss_counter = 0;
-				}*/
+				}
 
 				if (visualize_learned_func) {
 					//network->inference(inference_stream, inference_batch, prediction);
