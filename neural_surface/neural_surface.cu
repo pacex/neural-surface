@@ -37,6 +37,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <sstream>
 #include <iostream>
 #include <random>
 #include <stdexcept>
@@ -127,16 +128,16 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 	// Pick random face
 	// TODO: weight by face area
 	float r = fmodf(curand_uniform(crs + idx), 1.0f);
-	r *= n_faces - 1.f;
+	r *= n_faces;
 	int faceId = (int)r;
 
 	int iv1, iv2, iv3; // Indices of adjacent vertices
 	iv1 = indices[3 * faceId + 0].vertex_index;
 	iv2 = indices[3 * faceId + 1].vertex_index;
 	iv3 = indices[3 * faceId + 2].vertex_index;
-	assert(iv1 == indices[3 * faceId + 0].texcoord_index);
-	assert(iv2 == indices[3 * faceId + 1].texcoord_index);
-	assert(iv3 == indices[3 * faceId + 2].texcoord_index);
+	//assert(iv1 == indices[3 * faceId + 0].texcoord_index);
+	//assert(iv2 == indices[3 * faceId + 1].texcoord_index);
+	//assert(iv3 == indices[3 * faceId + 2].texcoord_index);
 
 	result[output_idx + 0] = (float)faceId;
 	//result[output_idx + 0] = (float)iv1;
@@ -170,10 +171,12 @@ __global__ void rescale_faceIds(uint32_t n_elements, uint32_t n_faces, float* tr
 	float scale = 1.0f / (float)n_faces;
 
 	result[input_idx + 0] = training_batch[output_idx + 0] * scale;
+	result[input_idx + 1] = training_batch[output_idx + 1];
+	result[input_idx + 2] = training_batch[output_idx + 2];
 
 }
 
-__global__ void generate_training_target(uint32_t n_elements, cudaTextureObject_t texture, float* training_batch, tinyobj::index_t* indices, float* texcoords, float* result) {
+__global__ void generate_training_target(uint32_t n_elements, uint32_t n_faces, cudaTextureObject_t texture, float* training_batch, tinyobj::index_t* indices, float* texcoords, float* result) {
 
 	int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
@@ -192,7 +195,7 @@ __global__ void generate_training_target(uint32_t n_elements, cudaTextureObject_
 	//w2 = training_batch[input_idx + 4];
 	//w3 = training_batch[input_idx + 5];
 
-	faceId = training_batch[input_idx + 0];
+	faceId = (int)training_batch[input_idx + 0];
 	iv1 = indices[3 * faceId + 0].texcoord_index;
 	iv2 = indices[3 * faceId + 1].texcoord_index;
 	iv3 = indices[3 * faceId + 2].texcoord_index;
@@ -213,6 +216,18 @@ __global__ void generate_training_target(uint32_t n_elements, cudaTextureObject_
 	result[output_idx + 1] = val.y;
 	result[output_idx + 2] = val.z;
 
+}
+
+std::vector<std::string> splitString(std::string input, char delimiter) {
+	std::vector<std::string> result;
+	std::istringstream stream(input);
+	std::string token;
+
+	while (std::getline(stream, token, delimiter)) {
+		result.push_back(token);
+	}
+
+	return result;
 }
 
 int main(int argc, char* argv[]) {
@@ -250,11 +265,13 @@ int main(int argc, char* argv[]) {
 			}},
 			{"encoding", {
 				{"otype", "HashGrid"},
+				{"type", "Hash"},
 				{"n_levels", 16},
 				{"n_features_per_level", 2},
-				{"log2_hashmap_size", 15},
-				{"base_resolution", 16},
-				{"per_level_scale", 1.5},
+				{"log2_hashmap_size", 9},
+				{"base_resolution", 8},
+				{"per_level_scale", 2},
+				{"interpolation", "Linear"},
 			}},
 			{"network", {
 				{"otype", "FullyFusedMLP"},
@@ -277,7 +294,7 @@ int main(int argc, char* argv[]) {
 		*  ======================
 		*/
 
-		std::string path = "data/objects/wheatley.obj";
+		std::string path = "data/objects/simple.obj";
 
 		std::cout << "Loading " << path << "..." << std::flush;
 		tinyobj::attrib_t attrib;
@@ -301,9 +318,11 @@ int main(int argc, char* argv[]) {
 			exit(1);
 		}
 
-		int shapeIndex = 1;
+		int shapeIndex = 0;
 		int n_vertices = attrib.vertices.size() / 3;
-		assert(n_vertices == attrib.texcoords.size() / 2);
+		int n_texcoords = attrib.texcoords.size() / 2;
+
+		//assert(n_vertices == attrib.texcoords.size() / 2);
 
 		int n_indices = shapes[shapeIndex].mesh.indices.size();
 		int n_faces = n_indices / 3;
@@ -311,7 +330,7 @@ int main(int argc, char* argv[]) {
 		// write vertices and indices to GPU memory
 		GPUMemory<float> vertices(n_vertices * 3);
 		vertices.copy_from_host(attrib.vertices);
-		GPUMemory<float> texcoords(n_vertices * 2);
+		GPUMemory<float> texcoords(n_texcoords * 2);
 		texcoords.copy_from_host(attrib.texcoords);
 
 		GPUMemory<tinyobj::index_t> indices(n_indices);
@@ -345,6 +364,77 @@ int main(int argc, char* argv[]) {
 
 		cudaTextureObject_t texture;
 		CUDA_CHECK_THROW(cudaCreateTextureObject(&texture, &resDesc, &texDesc, nullptr));
+
+		/* =======================
+		*  === LOAD TEST INPUT ===
+		*  =======================
+		*/
+
+		const bool testInput = true;
+
+		// Vector to store the floats
+		
+		int sampleWidth, sampleHeight;
+		sampleWidth = 0;
+		sampleHeight = 0;
+		std::vector<float> surface_positions;
+
+		if (testInput) {
+			const std::string csvFilePath = "sample.csv";
+
+			std::ifstream file(csvFilePath);
+
+			if (!file.is_open()) {
+				std::cerr << "Error opening file: " << csvFilePath << std::endl;
+				return 1;
+			}		
+
+			// Read width and height
+			std::string firstLine;	
+
+			if (std::getline(file, firstLine)) {
+				std::vector<std::string> w_and_h = splitString(firstLine, ',');
+				sampleWidth = std::stoi(w_and_h[0]);
+				sampleHeight = std::stoi(w_and_h[1]);
+			}
+			else {
+				std::cerr << "Error reading sample.csv" << std::endl;
+				return 1;
+			}
+
+			// Continue reading the remaining lines
+			std::string line;
+			while (std::getline(file, line)) {
+				std::vector<std::string> w_and_h = splitString(line, ',');
+				surface_positions.push_back(std::stof(w_and_h[0]));
+				surface_positions.push_back(std::stof(w_and_h[1]));
+				surface_positions.push_back(std::stof(w_and_h[2]));
+
+			}
+
+			// Close the file
+			file.close();
+		}
+
+		// Write surface_positions to GPU memory
+		GPUMemory<float> test_batch(sampleWidth * sampleHeight * 3);
+		test_batch.copy_from_host(surface_positions.data());
+
+		if (testInput) {
+			
+			cudaStream_t test_generator_stream;
+			CUDA_CHECK_THROW(cudaStreamCreate(&test_generator_stream));
+			GPUMatrix<float> test_generator_batch(test_batch.data(), 3, sampleWidth * sampleHeight);
+			GPUMatrix<float> test_generator_result(3, sampleWidth * sampleHeight);
+			linear_kernel(generate_training_target, 0, test_generator_stream, sampleWidth * sampleHeight, n_faces, texture, test_generator_batch.data(), indices.data(), texcoords.data(), test_generator_result.data());
+
+			auto filename = "data_generator_test.jpg";
+			std::cout << "Writing '" << filename << "'... ";
+			save_image(test_generator_result.data(), sampleWidth, sampleHeight, 3, 3, filename);
+			std::cout << "done." << std::endl;
+			
+		}
+
 
 
 		// Third step: sample a reference image to dump to disk. Visual comparison of this reference image and the learned
@@ -387,9 +477,11 @@ int main(int argc, char* argv[]) {
 
 		// Various constants for the network and optimization
 		const uint32_t batch_size = 1 << 18;
-		const uint32_t n_training_steps = argc >= 4 ? atoi(argv[3]) : 10000000;
+		//const uint32_t n_training_steps = argc >= 4 ? atoi(argv[3]) : 10000000;
 		const uint32_t n_input_dims = N_INPUT_DIMS; // (v1, v2, v3, alpha, beta, gamma)
 		const uint32_t n_output_dims = N_OUTPUT_DIMS; // RGB color
+
+		const uint32_t n_training_steps = 6000;
 
 		cudaStream_t inference_stream;
 		CUDA_CHECK_THROW(cudaStreamCreate(&inference_stream));
@@ -401,10 +493,6 @@ int main(int argc, char* argv[]) {
 		GPUMatrix<float> training_batch_raw(n_input_dims, batch_size);
 		GPUMatrix<float> training_batch(n_input_dims, batch_size);
 		GPUMatrix<float> training_target(n_output_dims, batch_size);
-
-		// Auxiliary matrices for evaluation
-		//GPUMatrix<float> prediction(n_output_dims, n_coords_padded);
-		//GPUMatrix<float> inference_batch(xs_and_ys.data(), n_input_dims, n_coords_padded);
 
 		json encoding_opts = config.value("encoding", json::object());
 		json loss_opts = config.value("loss", json::object());
@@ -445,13 +533,13 @@ int main(int argc, char* argv[]) {
 				linear_kernel(rescale_faceIds, 0, training_stream, batch_size, n_faces, training_batch_raw.data(), training_batch.data());
 
 				// Sample reference texture at surface points - training output
-				linear_kernel(generate_training_target, 0, training_stream, batch_size, texture, training_batch_raw.data(), indices.data(), texcoords.data(), training_target.data());
+				linear_kernel(generate_training_target, 0, training_stream, batch_size, n_faces, texture, training_batch_raw.data(), indices.data(), texcoords.data(), training_target.data());
 
 				cudaFree(crs);
 
 				// Debug
-				//std::vector<float> in = training_batch_obj.to_cpu_vector();
-				//std::vector<float> out = training_target_obj.to_cpu_vector();
+				std::vector<float> in = training_batch.to_cpu_vector();
+				//std::vector<float> out = training_target.to_cpu_vector();
 			}
 
 			/* =========================
@@ -484,12 +572,20 @@ int main(int argc, char* argv[]) {
 					tmp_loss_counter = 0;
 				}
 
-				if (visualize_learned_func) {
-					//network->inference(inference_stream, inference_batch, prediction);
-					//auto filename = fmt::format("{}.jpg", i);
-					//std::cout << "Writing '" << filename << "'... ";
-					//save_image(prediction.data(), sampling_width, sampling_height, 3, n_output_dims, filename);
-					//std::cout << "done." << std::endl;
+				if (visualize_learned_func && testInput) {
+
+					// Auxiliary matrices for evaluation
+					GPUMatrix<float> prediction(n_output_dims, sampleWidth * sampleHeight);
+					GPUMatrix<float> inference_batch_raw(test_batch.data(), n_input_dims, sampleWidth * sampleHeight);
+					GPUMatrix<float> inference_batch(n_input_dims, sampleWidth * sampleHeight);
+					linear_kernel(rescale_faceIds, 0, inference_stream, sampleWidth * sampleHeight, n_faces, inference_batch_raw.data(), inference_batch.data());
+
+					network->inference(inference_stream, inference_batch, prediction);
+					std::vector<float> debug = prediction.to_cpu_vector();
+					auto filename = fmt::format("{}.jpg", i);
+					std::cout << "Writing '" << filename << "'... ";
+					save_image(prediction.data(), sampleWidth, sampleHeight, 3, 3, filename);
+					std::cout << "done." << std::endl;
 				}
 
 				// Don't count visualizing as part of timing
