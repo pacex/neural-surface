@@ -1,0 +1,13 @@
+# Blender 4.0.2 MTL File: 'chessboard.blend'
+# www.blender.org
+
+newmtl Chessboard
+Ns 250.000000
+Ka 1.000000 1.000000 1.000000
+Ks 0.522807 0.522807 0.522807
+Ke 0.000000 0.000000 0.000000
+Ni 1.500000
+d 1.000000
+illum 2
+# map_Kd C:/chessboard_base_color.jpg
+# map_Bump -bm 1.000000 C:/Users/pascal.walloner/Downloads/chessboard_normal.jpg

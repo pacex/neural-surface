@@ -123,7 +123,7 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 	if (idx >= n_elements)
 		return;
 
-	int output_idx = idx * N_INPUT_DIMS;
+	int output_idx = idx * 3;
 
 	// Pick random face
 	// TODO: weight by face area
@@ -165,8 +165,8 @@ __global__ void rescale_faceIds(uint32_t n_elements, uint32_t n_faces, float* tr
 	if (idx >= n_elements)
 		return;
 
-	int input_idx = idx * N_INPUT_DIMS;
-	int output_idx = idx * N_INPUT_DIMS;
+	int input_idx = idx * 3;
+	int output_idx = idx * 3;
 
 	float scale = 1.0f / (float)n_faces;
 
@@ -183,8 +183,8 @@ __global__ void generate_training_target(uint32_t n_elements, uint32_t n_faces, 
 	if (idx >= n_elements)
 		return;
 
-	int input_idx = idx * N_INPUT_DIMS;
-	int output_idx = idx * N_OUTPUT_DIMS;
+	int input_idx = idx * 3;
+	int output_idx = idx * 3;
 
 	int iv1, iv2, iv3, faceId;
 	float w1, w2, w3;
@@ -196,6 +196,13 @@ __global__ void generate_training_target(uint32_t n_elements, uint32_t n_faces, 
 	//w3 = training_batch[input_idx + 5];
 
 	faceId = (int)training_batch[input_idx + 0];
+	if (faceId < 0 || faceId >= n_faces) {
+		result[output_idx + 0] = 0.f;
+		result[output_idx + 1] = 0.f;
+		result[output_idx + 2] = 0.f;
+		return;
+	}
+
 	iv1 = indices[3 * faceId + 0].texcoord_index;
 	iv2 = indices[3 * faceId + 1].texcoord_index;
 	iv3 = indices[3 * faceId + 2].texcoord_index;
@@ -289,21 +296,29 @@ int main(int argc, char* argv[]) {
 			config = json::parse(f, nullptr, true, /*skip_comments=*/true);
 		}
 
+		/* =========================
+		*  === LAUNCH PARAMETERS ===
+		*  =========================
+		*/
+
+		std::string object_path = "data/objects/wheatley.obj";
+		std::string texture_path = "data/objects/wheatley.png";
+		std::string sample_path = "data/objects/sample_wheatley.csv";
+
+
 		/* ======================
 		*  === LOAD .OBJ FILE ===
 		*  ======================
 		*/
 
-		std::string path = "data/objects/simple.obj";
-
-		std::cout << "Loading " << path << "..." << std::flush;
+		std::cout << "Loading " << object_path << "..." << std::flush;
 		tinyobj::attrib_t attrib;
 		std::vector<tinyobj::shape_t> shapes;
 		std::vector<tinyobj::material_t> materials;
 		std::string err;
 		std::string warn;
 		// Expect '.mtl' file in the same directory and triangulate meshes
-		bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, path.c_str());
+		bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, object_path.c_str());
 		if (!err.empty())
 		{ // `err` may contain warning message.
 			std::cerr << err << std::endl;
@@ -342,7 +357,7 @@ int main(int argc, char* argv[]) {
 		*/
 
 		int width, height;
-		GPUMemory<float> image = load_image(argv[1], width, height);
+		GPUMemory<float> image = load_image(texture_path, width, height);
 
 		// Second step: create a cuda texture out of this image. It'll be used to generate training data efficiently on the fly
 		cudaResourceDesc resDesc;
@@ -380,12 +395,11 @@ int main(int argc, char* argv[]) {
 		std::vector<float> surface_positions;
 
 		if (testInput) {
-			const std::string csvFilePath = "sample.csv";
 
-			std::ifstream file(csvFilePath);
+			std::ifstream file(sample_path);
 
 			if (!file.is_open()) {
-				std::cerr << "Error opening file: " << csvFilePath << std::endl;
+				std::cerr << "Error opening file: " << sample_path << std::endl;
 				return 1;
 			}		
 
