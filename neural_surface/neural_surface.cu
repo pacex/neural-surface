@@ -47,6 +47,8 @@
 #include <curand.h>
 #include <curand_kernel.h>
 #include <math.h>
+#include <tiny-cuda-nn/encodings/vertex.h>
+#include <tiny-cuda-nn/encoding.h>
 
 #define TINYOBJLOADER_IMPLEMENTATION
 #include "tiny_obj_loader.h"
@@ -291,6 +293,38 @@ int main(int argc, char* argv[]) {
 			}},
 		};
 
+		json config_vertex = {
+			{"loss", {
+				{"otype", "RelativeL2"}
+			}},
+			{"optimizer", {
+				{"otype", "Adam"},
+				// {"otype", "Shampoo"},
+				{"learning_rate", 1e-2},
+				{"beta1", 0.9f},
+				{"beta2", 0.99f},
+				{"l2_reg", 0.0f},
+				// The following parameters are only used when the optimizer is "Shampoo".
+				{"beta3", 0.9f},
+				{"beta_shampoo", 0.0f},
+				{"identity", 0.0001f},
+				{"cg_on_momentum", false},
+				{"frobenius_normalization", true},
+			}},
+			{"encoding", {
+				{"otype", "Vertex"},
+				{"n_frequencies", 12},
+			}},
+			{"network", {
+				{"otype", "FullyFusedMLP"},
+				// {"otype", "CutlassMLP"},
+				{"n_neurons", 64},
+				{"n_hidden_layers", 4},
+				{"activation", "ReLU"},
+				{"output_activation", "None"},
+			}},
+		};
+
 		if (argc >= 3) {
 			std::cout << "Loading custom json config '" << argv[2] << "'." << std::endl;
 			std::ifstream f{argv[2]};
@@ -511,13 +545,14 @@ int main(int argc, char* argv[]) {
 		GPUMatrix<float> training_target(n_output_dims, batch_size);
 
 		json encoding_opts = config.value("encoding", json::object());
+		json encoding_opts_vertex = config_vertex.value("encoding", json::object());
 		json loss_opts = config.value("loss", json::object());
 		json optimizer_opts = config.value("optimizer", json::object());
 		json network_opts = config.value("network", json::object());
 
 		std::shared_ptr<Loss<precision_t>> loss{ create_loss<precision_t>(loss_opts) };
 		std::shared_ptr<Optimizer<precision_t>> optimizer{ create_optimizer<precision_t>(optimizer_opts) };
-		std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(n_input_dims, n_output_dims, encoding_opts, network_opts);
+		std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(std::shared_ptr<Encoding<precision_t>>{create_vertex_encoding<precision_t>(n_input_dims, encoding_opts_vertex)}, n_output_dims, network_opts);
 
 		auto model = std::make_shared<Trainer<float, precision_t, precision_t>>(network, optimizer, loss);
 
