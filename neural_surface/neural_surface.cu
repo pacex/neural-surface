@@ -129,7 +129,7 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 	// TODO: weight by face area
 	float r = fmodf(curand_uniform(crs + idx), 1.0f);
 	r *= n_faces;
-	int faceId = (int)r;
+	uint32_t faceId = (uint32_t)r;
 
 	int iv1, iv2, iv3; // Indices of adjacent vertices
 	iv1 = indices[3 * faceId + 0].vertex_index;
@@ -139,12 +139,13 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 	//assert(iv2 == indices[3 * faceId + 1].texcoord_index);
 	//assert(iv3 == indices[3 * faceId + 2].texcoord_index);
 
-	result[output_idx + 0] = (float)faceId;
+	result[output_idx + 0] = *((float*) &faceId);
 	//result[output_idx + 0] = (float)iv1;
 	//result[output_idx + 1] = (float)iv2;
 	//result[output_idx + 2] = (float)iv3;
 
-	float alpha, beta, gamma; // Barycentric coordinates
+	// Barycentric coordinates
+	float alpha, beta, gamma;
 	// TODO: is this actually uniform??
 	alpha = curand_uniform(crs + idx);
 	beta = curand_uniform(crs + idx) * (1.0f - alpha);
@@ -168,9 +169,9 @@ __global__ void rescale_faceIds(uint32_t n_elements, uint32_t n_faces, float* tr
 	int input_idx = idx * 3;
 	int output_idx = idx * 3;
 
-	float scale = 1.0f / (float)n_faces;
+	uint32_t faceId = *((uint32_t*) &training_batch[output_idx + 0]);
 
-	result[input_idx + 0] = training_batch[output_idx + 0] * scale;
+	result[input_idx + 0] = (float)faceId / (float)n_faces;
 	result[input_idx + 1] = training_batch[output_idx + 1];
 	result[input_idx + 2] = training_batch[output_idx + 2];
 
@@ -195,7 +196,7 @@ __global__ void generate_training_target(uint32_t n_elements, uint32_t n_faces, 
 	//w2 = training_batch[input_idx + 4];
 	//w3 = training_batch[input_idx + 5];
 
-	faceId = (int)training_batch[input_idx + 0];
+	faceId = *((uint32_t*)&training_batch[input_idx + 0]);
 	if (faceId < 0 || faceId >= n_faces) {
 		result[output_idx + 0] = 0.f;
 		result[output_idx + 1] = 0.f;
@@ -275,7 +276,7 @@ int main(int argc, char* argv[]) {
 				{"type", "Hash"},
 				{"n_levels", 16},
 				{"n_features_per_level", 2},
-				{"log2_hashmap_size", 9},
+				{"log2_hashmap_size", 19},
 				{"base_resolution", 8},
 				{"per_level_scale", 2},
 				{"interpolation", "Linear"},
@@ -301,9 +302,9 @@ int main(int argc, char* argv[]) {
 		*  =========================
 		*/
 
-		std::string object_path = "data/objects/wheatley.obj";
-		std::string texture_path = "data/objects/wheatley.png";
-		std::string sample_path = "data/objects/sample_wheatley.csv";
+		std::string object_path = "data/objects/simple.obj";
+		std::string texture_path = "data/objects/dice_texture.jpg";
+		std::string sample_path = "data/objects/sample.csv";
 
 
 		/* ======================
@@ -419,10 +420,11 @@ int main(int argc, char* argv[]) {
 			// Continue reading the remaining lines
 			std::string line;
 			while (std::getline(file, line)) {
-				std::vector<std::string> w_and_h = splitString(line, ',');
-				surface_positions.push_back(std::stof(w_and_h[0]));
-				surface_positions.push_back(std::stof(w_and_h[1]));
-				surface_positions.push_back(std::stof(w_and_h[2]));
+				std::vector<std::string> s_pos = splitString(line, ',');
+				uint32_t faceId = static_cast<uint32_t>(std::stoul(s_pos[0]));
+				surface_positions.push_back(*((float*) &faceId));
+				surface_positions.push_back(std::stof(s_pos[1]));
+				surface_positions.push_back(std::stof(s_pos[2]));
 
 			}
 
