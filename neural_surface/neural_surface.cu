@@ -314,7 +314,7 @@ int main(int argc, char* argv[]) {
 			}},
 			{"encoding", {
 				{"otype", "Vertex"},
-				{"n_frequencies", 12},
+				{"n_features", 16},
 			}},
 			{"network", {
 				{"otype", "FullyFusedMLP"},

@@ -102,33 +102,50 @@ __global__ void vertex_encoding(
 template <typename T>
 __global__ void vertex_encoding_backward(
 	const uint32_t num_elements,
+	const uint32_t n_features,
+	const uint32_t n_faces,
+	const uint32_t n_vertices,
+	tinyobj::index_t* indices,
+	T* features,
+	MatrixView<const float> data_in,
 	MatrixView<const T> dL_dy,
-	const float* dy_dx,
-	MatrixView<float> dL_dx
+	const float* dy_dx
+	//MatrixView<float> dL_dx
 ) {
 	const uint32_t encoded_index = threadIdx.x + blockIdx.x * blockDim.x;
 	if (encoded_index >= num_elements) return;
 
 	// TODO: implement backward pass
-}
+	const uint32_t i = encoded_index / n_features;
+	const uint32_t j = encoded_index - i * n_features;
 
-template <typename T>
-__global__ void init_features(
-	const uint32_t num_elements,
-	curandState* crs,
-	T* features
-) {
-	const uint32_t idx = threadIdx.x + blockIdx.x * blockDim.x;
-	if (idx >= num_elements)
+	if (data_in(0, i) < 0.f) {
 		return;
+	}
 
-	// Initialze features uniformly in [-b,b]
-	float b = 0.02f;
-	curand_init(1337, idx, 0, &crs[idx]);
-	features[idx] = (T)((fmodf(curand_uniform(&crs[idx]), 1.0f) - 0.5f) * b);
+	// Decode face id
+	uint32_t faceId = *((uint32_t*)&data_in(0, i));
+	assert(faceId < n_faces);
+
+	// Get Barycentric Coordinates
+	T w0 = data_in(1, i);
+	T w1 = data_in(2, i);
+	T w2 = (T)1.0f - w0 - w1;
+
+	// Look up vertex IDs
+	uint32_t f0 = indices[3 * faceId + 0].vertex_index;
+	uint32_t f1 = indices[3 * faceId + 1].vertex_index;
+	uint32_t f2 = indices[3 * faceId + 2].vertex_index;
+	assert(f0 < n_vertices);
+	assert(f1 < n_vertices);
+	assert(f2 < n_vertices);
+
+	T gradient = dL_dy(j, i);
+	atomicAdd(&features[n_features * f0 + j], gradient * w0);
+	atomicAdd(&features[n_features * f1 + j], gradient * w1);
+	atomicAdd(&features[n_features * f2 + j], gradient * w2);
+
 }
-
-
 
 template <typename T>
 class VertexEncoding : public Encoding<T> {
@@ -137,14 +154,8 @@ public:
 		: n_features{ n_features }, m_n_dims_to_encode{ n_dims_to_encode }, n_vertices{ n_vertices }, n_faces{ n_faces }
 	{
 		m_n_output_dims = n_features;
-		features = GPUMemory<T>(n_vertices * n_features);
+		m_n_params = n_features * n_vertices;
 
-		curandState* crs;
-		cudaMalloc(&crs, sizeof(curandState) * n_vertices * n_features);
-
-		linear_kernel(init_features<T>, 0, nullptr, n_vertices * n_features, crs, features.data());
-
-		cudaFree(crs);
 		this->indices = GPUMemory<tinyobj::index_t>(indices.size());
 		this->indices.copy_from_host(indices);
 	}
@@ -173,7 +184,7 @@ public:
 			n_vertices,
 			padded_output_width(),
 			indices.data(),
-			features.data(),
+			use_inference_params ? this->inference_params() : this->params(),
 			input.view(),
 			output->view()
 		);
@@ -191,17 +202,24 @@ public:
 		bool use_inference_params = false,
 		GradientMode param_gradients_mode = GradientMode::Overwrite
 	) override {
-		if (!dL_dinput) {
+		const uint32_t num_elements = input.n();
+		if ((!dL_dinput && param_gradients_mode == GradientMode::Ignore) || num_elements == 0) {
 			return;
 		}
 
 		const auto& forward = dynamic_cast<const ForwardContext&>(ctx);
 
 		linear_kernel(vertex_encoding_backward<T>, 0, stream,
-			input.n() * m_n_dims_to_encode,
+			input.n() * n_features,
+			n_features,
+			n_faces,
+			n_vertices,
+			indices.data(),
+			use_inference_params ? this->inference_params() : this->params(),
+			input.view(),
 			dL_doutput.view(),
-			forward.dy_dx.data(),
-			dL_dinput->view()
+			forward.dy_dx.data()
+			//dL_dinput->view()
 		);
 	}
 
@@ -234,6 +252,17 @@ public:
 		return AoS;
 	}
 
+	void set_params_impl(T* params, T* inference_params, T* gradients) override { }
+
+	void initialize_params(pcg32& rnd, float* params_full_precision, float scale = 1) override {
+		// Initialize the hashgrid from the GPU, because the number of parameters can be quite large.
+		generate_random_uniform<float>(rnd, n_params(), params_full_precision, -1e-4f * scale, 1e-4f * scale);
+	}
+
+	size_t n_params() const override {
+		return m_n_params;
+	}
+
 	json hyperparams() const override {
 		return {
 			{"otype", "Vertex"},
@@ -247,10 +276,10 @@ private:
 	};
 
 	uint32_t m_n_dims_to_encode;
+	uint32_t m_n_params;
 	uint32_t n_features;
 	uint32_t n_vertices;
 	uint32_t n_faces;
-	GPUMemory<T> features;
 
 	GPUMemory<tinyobj::index_t> indices;
 
