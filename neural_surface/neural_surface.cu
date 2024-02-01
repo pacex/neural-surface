@@ -55,6 +55,7 @@
 
 using namespace tcnn;
 using precision_t = network_precision_t;
+//using precision_t = float;
 
 GPUMemory<float> load_image(const std::string& filename, int& width, int& height) {
 	// width * height * RGBA
@@ -274,7 +275,7 @@ int main(int argc, char* argv[]) {
 				{"frobenius_normalization", true},
 			}},
 			{"encoding", {
-				{"otype", "HashGrid"},
+				{"otype", "Identity"},
 				{"type", "Hash"},
 				{"n_levels", 16},
 				{"n_features_per_level", 2},
@@ -384,7 +385,8 @@ int main(int argc, char* argv[]) {
 		texcoords.copy_from_host(attrib.texcoords);
 
 		GPUMemory<tinyobj::index_t> indices(n_indices);
-		indices.copy_from_host(shapes[shapeIndex].mesh.indices);
+		std::vector<tinyobj::index_t> ind_vec = shapes[shapeIndex].mesh.indices;
+		indices.copy_from_host(ind_vec);
 
 		/* ==============================
 		*  === LOAD REFERENCE TEXTURE ===
@@ -552,7 +554,8 @@ int main(int argc, char* argv[]) {
 
 		std::shared_ptr<Loss<precision_t>> loss{ create_loss<precision_t>(loss_opts) };
 		std::shared_ptr<Optimizer<precision_t>> optimizer{ create_optimizer<precision_t>(optimizer_opts) };
-		std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(std::shared_ptr<Encoding<precision_t>>{create_vertex_encoding<precision_t>(n_input_dims, encoding_opts_vertex)}, n_output_dims, network_opts);
+		std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(std::shared_ptr<Encoding<precision_t>>{create_vertex_encoding<precision_t>(n_input_dims, n_vertices, n_faces, ind_vec, encoding_opts_vertex)}, n_output_dims, network_opts);
+		// std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(std::shared_ptr<Encoding<precision_t>>{create_encoding<precision_t>(n_input_dims, encoding_opts)}, n_output_dims, network_opts);
 
 		auto model = std::make_shared<Trainer<float, precision_t, precision_t>>(network, optimizer, loss);
 
@@ -581,7 +584,7 @@ int main(int argc, char* argv[]) {
 
 				// Generate Surface Points - training input
 				linear_kernel(generate_face_positions, 0, training_stream, batch_size, n_faces, crs, indices.data(), vertices.data(), training_batch_raw.data());
-				linear_kernel(rescale_faceIds, 0, training_stream, batch_size, n_faces, training_batch_raw.data(), training_batch.data());
+				//linear_kernel(rescale_faceIds, 0, training_stream, batch_size, n_faces, training_batch_raw.data(), training_batch.data());
 
 				// Sample reference texture at surface points - training output
 				linear_kernel(generate_training_target, 0, training_stream, batch_size, n_faces, texture, training_batch_raw.data(), indices.data(), texcoords.data(), training_target.data());
@@ -589,7 +592,7 @@ int main(int argc, char* argv[]) {
 				cudaFree(crs);
 
 				// Debug
-				std::vector<float> in = training_batch.to_cpu_vector();
+				//std::vector<float> in = training_batch.to_cpu_vector();
 				//std::vector<float> out = training_target.to_cpu_vector();
 			}
 
@@ -601,7 +604,7 @@ int main(int argc, char* argv[]) {
 			{
 				//auto ctx = trainer->training_step(training_stream, training_batch, training_target);
 
-				auto ctx_obj = model->training_step(training_stream, training_batch, training_target);
+				auto ctx_obj = model->training_step(training_stream, training_batch_raw, training_target);
 
 				if (i % std::min(interval, (uint32_t)100) == 0) {
 					tmp_loss += model->loss(training_stream, *ctx_obj);
@@ -631,7 +634,7 @@ int main(int argc, char* argv[]) {
 					GPUMatrix<float> inference_batch(n_input_dims, sampleWidth * sampleHeight);
 					linear_kernel(rescale_faceIds, 0, inference_stream, sampleWidth * sampleHeight, n_faces, inference_batch_raw.data(), inference_batch.data());
 
-					network->inference(inference_stream, inference_batch, prediction);
+					network->inference(inference_stream, inference_batch_raw, prediction);
 					std::vector<float> debug = prediction.to_cpu_vector();
 					auto filename = fmt::format("{}.jpg", i);
 					std::cout << "Writing '" << filename << "'... ";
