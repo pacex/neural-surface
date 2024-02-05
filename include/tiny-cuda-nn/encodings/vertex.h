@@ -141,17 +141,20 @@ __global__ void vertex_encoding_backward(
 	assert(f2 < n_vertices);
 
 	T gradient = dL_dy(j, i);
-	atomicAdd(&features[n_features * f0 + j], gradient * w0);
-	atomicAdd(&features[n_features * f1 + j], gradient * w1);
-	atomicAdd(&features[n_features * f2 + j], gradient * w2);
+	atomicAdd(&features[n_features * f0 + j], -gradient * w0);
+	atomicAdd(&features[n_features * f1 + j], -gradient * w1);
+	atomicAdd(&features[n_features * f2 + j], -gradient * w2);
 
 }
+
+enum OutputConstruction { lin_interp, concat };
 
 template <typename T>
 class VertexEncoding : public Encoding<T> {
 public:
-	VertexEncoding(uint32_t n_features, uint32_t n_dims_to_encode, uint32_t n_vertices, uint32_t n_faces, std::vector<tinyobj::index_t> indices)
-		: n_features{ n_features }, m_n_dims_to_encode{ n_dims_to_encode }, n_vertices{ n_vertices }, n_faces{ n_faces }
+	// TODO: remoce n_faces parameter
+	VertexEncoding(uint32_t n_features, uint32_t n_dims_to_encode, uint32_t n_vertices, uint32_t n_faces, OutputConstruction output_construction, std::vector<tinyobj::index_t> indices)
+		: m_n_features{ n_features }, m_n_dims_to_encode{ n_dims_to_encode }, m_n_vertices{ n_vertices }, m_n_faces{ n_faces }, m_output_construction{ output_construction }
 	{
 		m_n_output_dims = n_features;
 		m_n_params = n_features * n_vertices;
@@ -174,14 +177,14 @@ public:
 		}
 
 		if (prepare_input_gradients) {
-			forward->dy_dx = GPUMatrix<float>{n_features, input.n(), stream};
+			forward->dy_dx = GPUMatrix<float>{m_n_features, input.n(), stream};
 		}
 
 		linear_kernel(vertex_encoding<T>, 0, stream,
 			input.n() * padded_output_width(),
-			n_features,
-			n_faces,
-			n_vertices,
+			m_n_features,
+			m_n_faces,
+			m_n_vertices,
 			padded_output_width(),
 			indices.data(),
 			use_inference_params ? this->inference_params() : this->params(),
@@ -210,10 +213,10 @@ public:
 		const auto& forward = dynamic_cast<const ForwardContext&>(ctx);
 
 		linear_kernel(vertex_encoding_backward<T>, 0, stream,
-			input.n() * n_features,
-			n_features,
-			n_faces,
-			n_vertices,
+			input.n() * m_n_features,
+			m_n_features,
+			m_n_faces,
+			m_n_vertices,
 			indices.data(),
 			use_inference_params ? this->inference_params() : this->params(),
 			input.view(),
@@ -266,7 +269,7 @@ public:
 	json hyperparams() const override {
 		return {
 			{"otype", "Vertex"},
-			{"n_features", n_features},
+			{"n_features", m_n_features},
 		};
 	}
 
@@ -275,11 +278,13 @@ private:
 		GPUMatrix<float> dy_dx;
 	};
 
+	OutputConstruction m_output_construction;
+
 	uint32_t m_n_dims_to_encode;
 	uint32_t m_n_params;
-	uint32_t n_features;
-	uint32_t n_vertices;
-	uint32_t n_faces;
+	uint32_t m_n_features;
+	uint32_t m_n_vertices;
+	uint32_t m_n_faces;
 
 	GPUMemory<tinyobj::index_t> indices;
 
@@ -289,8 +294,8 @@ private:
 };
 
 template <typename T>
-VertexEncoding<T>* create_vertex_encoding(uint32_t n_dims_to_encode, uint32_t n_vertices, uint32_t n_faces, std::vector<tinyobj::index_t> indices, const json& encoding) {
-	return new VertexEncoding<T>(encoding.value("n_features", 2u), n_dims_to_encode, n_vertices, n_faces, indices);
+VertexEncoding<T>* create_vertex_encoding(uint32_t n_dims_to_encode, uint32_t n_vertices, uint32_t n_faces, OutputConstruction output_construction, std::vector<tinyobj::index_t> indices, const json& encoding) {
+	return new VertexEncoding<T>(encoding.value("n_features", 2u), n_dims_to_encode, n_vertices, n_faces, output_construction, indices);
 }
 
 }

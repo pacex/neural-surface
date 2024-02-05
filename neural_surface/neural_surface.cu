@@ -314,7 +314,7 @@ int main(int argc, char* argv[]) {
 			}},
 			{"encoding", {
 				{"otype", "Vertex"},
-				{"n_features", 16},
+				{"n_features", 32},
 			}},
 			{"network", {
 				{"otype", "FullyFusedMLP"},
@@ -554,7 +554,7 @@ int main(int argc, char* argv[]) {
 
 		std::shared_ptr<Loss<precision_t>> loss{ create_loss<precision_t>(loss_opts) };
 		std::shared_ptr<Optimizer<precision_t>> optimizer{ create_optimizer<precision_t>(optimizer_opts) };
-		std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(std::shared_ptr<Encoding<precision_t>>{create_vertex_encoding<precision_t>(n_input_dims, n_vertices, n_faces, ind_vec, encoding_opts_vertex)}, n_output_dims, network_opts);
+		std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(std::shared_ptr<Encoding<precision_t>>{create_vertex_encoding<precision_t>(n_input_dims, n_vertices, n_faces, lin_interp, ind_vec, encoding_opts_vertex)}, n_output_dims, network_opts);
 		// std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(std::shared_ptr<Encoding<precision_t>>{create_encoding<precision_t>(n_input_dims, encoding_opts)}, n_output_dims, network_opts);
 
 		auto model = std::make_shared<Trainer<float, precision_t, precision_t>>(network, optimizer, loss);
