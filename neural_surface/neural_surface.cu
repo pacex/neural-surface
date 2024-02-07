@@ -119,7 +119,7 @@ __global__ void setup_kernel(uint32_t n_elements, curandState* state, int iter) 
 	curand_init(1337 + iter, idx, 0, &state[idx]);
 }
 
-__global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, curandState* crs, tinyobj::index_t* indices, float* vertices, float* result) {
+__global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, curandState* crs, tinyobj::index_t* indices, float* vertices, float* cdf, float* result) {
 
 	int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
@@ -131,8 +131,20 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 	// Pick random face
 	// TODO: weight by face area
 	float r = fmodf(curand_uniform(crs + idx), 1.0f);
-	r *= n_faces;
-	uint32_t faceId = (uint32_t)r;
+
+	/* 
+	uint32_t faceId = n_faces - 1;
+
+	for (uint32_t i = 0; i < n_faces; i++) {
+		if (r < cdf[i]) {
+			faceId = i;
+			break;
+		}
+	}
+	*/
+
+	uint32_t faceId = (uint32_t)(r * n_faces);
+
 
 	int iv1, iv2, iv3; // Indices of adjacent vertices
 	iv1 = indices[3 * faceId + 0].vertex_index;
@@ -315,6 +327,7 @@ int main(int argc, char* argv[]) {
 			{"encoding", {
 				{"otype", "Vertex"},
 				{"n_features", 32},
+				{"output_construction", "lin_interp"},
 			}},
 			{"network", {
 				{"otype", "FullyFusedMLP"},
@@ -337,9 +350,9 @@ int main(int argc, char* argv[]) {
 		*  =========================
 		*/
 
-		std::string object_path = "data/objects/simple.obj";
+		std::string object_path = "data/objects/simple_subdiv.obj";
 		std::string texture_path = "data/objects/dice_texture.jpg";
-		std::string sample_path = "data/objects/sample.csv";
+		std::string sample_path = "data/objects/sample_subdiv.csv";
 
 
 		/* ======================
@@ -373,16 +386,45 @@ int main(int argc, char* argv[]) {
 		int n_vertices = attrib.vertices.size() / 3;
 		int n_texcoords = attrib.texcoords.size() / 2;
 
-		//assert(n_vertices == attrib.texcoords.size() / 2);
-
 		int n_indices = shapes[shapeIndex].mesh.indices.size();
 		int n_faces = n_indices / 3;
 
-		// write vertices and indices to GPU memory
+		// Generate histogram of face areas to sample surface points
+		std::vector<float> histogram(n_faces);
+		float area_sum = 0.f;
+		for (size_t i = 0; i < n_faces; i++) {
+			vec3 v1(attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 0].vertex_index + 0],
+				attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 0].vertex_index + 1],
+				attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 0].vertex_index + 2]);
+
+			vec3 v2(attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 1].vertex_index + 0],
+				attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 1].vertex_index + 1],
+				attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 1].vertex_index + 2]);
+
+			vec3 v3(attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 2].vertex_index + 0],
+				attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 2].vertex_index + 1],
+				attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 2].vertex_index + 2]);
+
+			float area = 0.5f * length(cross(v2 - v1, v3 - v1));
+			histogram[i] = area;
+			area_sum += area;
+		}
+
+		// Create CDF from histogram
+		std::vector<float> cdf_host(n_faces);
+		float c_prob = 0.f;
+		for (size_t i = 0; i < n_faces; i++) {
+			c_prob += histogram[i] / area_sum;
+			cdf_host[i] = c_prob;
+		}
+
+		// write vertices, indices and cdf to GPU memory
 		GPUMemory<float> vertices(n_vertices * 3);
 		vertices.copy_from_host(attrib.vertices);
 		GPUMemory<float> texcoords(n_texcoords * 2);
 		texcoords.copy_from_host(attrib.texcoords);
+		GPUMemory<float> cdf(n_faces);
+		cdf.copy_from_host(cdf_host);
 
 		GPUMemory<tinyobj::index_t> indices(n_indices);
 		std::vector<tinyobj::index_t> ind_vec = shapes[shapeIndex].mesh.indices;
@@ -554,7 +596,7 @@ int main(int argc, char* argv[]) {
 
 		std::shared_ptr<Loss<precision_t>> loss{ create_loss<precision_t>(loss_opts) };
 		std::shared_ptr<Optimizer<precision_t>> optimizer{ create_optimizer<precision_t>(optimizer_opts) };
-		std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(std::shared_ptr<Encoding<precision_t>>{create_vertex_encoding<precision_t>(n_input_dims, n_vertices, n_faces, lin_interp, ind_vec, encoding_opts_vertex)}, n_output_dims, network_opts);
+		std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(std::shared_ptr<Encoding<precision_t>>{create_vertex_encoding<precision_t>(n_input_dims, n_vertices, n_faces, ind_vec, attrib.vertices, encoding_opts_vertex)}, n_output_dims, network_opts);
 		// std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(std::shared_ptr<Encoding<precision_t>>{create_encoding<precision_t>(n_input_dims, encoding_opts)}, n_output_dims, network_opts);
 
 		auto model = std::make_shared<Trainer<float, precision_t, precision_t>>(network, optimizer, loss);
@@ -583,7 +625,7 @@ int main(int argc, char* argv[]) {
 				linear_kernel(setup_kernel, 0, training_stream, batch_size, crs, i);
 
 				// Generate Surface Points - training input
-				linear_kernel(generate_face_positions, 0, training_stream, batch_size, n_faces, crs, indices.data(), vertices.data(), training_batch_raw.data());
+				linear_kernel(generate_face_positions, 0, training_stream, batch_size, n_faces, crs, indices.data(), vertices.data(), cdf.data(), training_batch_raw.data());
 				//linear_kernel(rescale_faceIds, 0, training_stream, batch_size, n_faces, training_batch_raw.data(), training_batch.data());
 
 				// Sample reference texture at surface points - training output
@@ -620,7 +662,7 @@ int main(int argc, char* argv[]) {
 				
 				if (print_loss) {
 					std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
-					std::cout << "Step#" << i << ": " << "loss=" << tmp_loss/(float)tmp_loss_counter << " time=" << std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count() << "[µs]" << std::endl;
+					std::cout << "Step#" << i << ": " << "loss=" << tmp_loss/(float)tmp_loss_counter << " time=" << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
 
 					tmp_loss = 0;
 					tmp_loss_counter = 0;
