@@ -119,6 +119,7 @@ __global__ void setup_kernel(uint32_t n_elements, curandState* state, int iter) 
 	curand_init(1337 + iter, idx, 0, &state[idx]);
 }
 
+template <typename T>
 __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, curandState* crs, tinyobj::index_t* indices, float* vertices, float* cdf, float* result) {
 
 	int idx = threadIdx.x + blockDim.x * blockIdx.x;
@@ -160,15 +161,17 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 	//result[output_idx + 2] = (float)iv3;
 
 	// Barycentric coordinates
-	float alpha, beta, gamma;
+	T alpha, beta, gamma;
 	// TODO: is this actually uniform??
-	alpha = curand_uniform(crs + idx);
-	beta = curand_uniform(crs + idx) * (1.0f - alpha);
-	gamma = 1.0f - alpha - beta;
+	alpha = (T)curand_uniform(crs + idx);
+	alpha = alpha - (T)(long)alpha;
+	beta = (T)curand_uniform(crs + idx) * ((T)1.0f - (T)alpha);
+	beta = beta - (T)(long)beta;
+	gamma = (T)1.0f - alpha - beta;
 
 
-	result[output_idx + 1] = alpha;
-	result[output_idx + 2] = beta;
+	result[output_idx + 1] = (float)alpha;
+	result[output_idx + 2] = (float)beta;
 	//result[output_idx + 3] = alpha;
 	//result[output_idx + 4] = beta;
 	//result[output_idx + 5] = gamma;
@@ -625,7 +628,7 @@ int main(int argc, char* argv[]) {
 				linear_kernel(setup_kernel, 0, training_stream, batch_size, crs, i);
 
 				// Generate Surface Points - training input
-				linear_kernel(generate_face_positions, 0, training_stream, batch_size, n_faces, crs, indices.data(), vertices.data(), cdf.data(), training_batch_raw.data());
+				linear_kernel(generate_face_positions<precision_t>, 0, training_stream, batch_size, n_faces, crs, indices.data(), vertices.data(), cdf.data(), training_batch_raw.data());
 				//linear_kernel(rescale_faceIds, 0, training_stream, batch_size, n_faces, training_batch_raw.data(), training_batch.data());
 
 				// Sample reference texture at surface points - training output
