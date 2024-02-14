@@ -327,7 +327,7 @@ int main(int argc, char* argv[]) {
 			{"encoding", {
 				{"otype", "Vertex"},
 				{"n_features", 32},
-				{"output_construction", "lin_interp"},
+				{"output_construction", "concat"},
 			}},
 			{"network", {
 				{"otype", "FullyFusedMLP"},

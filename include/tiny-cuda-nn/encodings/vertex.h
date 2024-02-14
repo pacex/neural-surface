@@ -107,7 +107,7 @@ __global__ void vertex_encoding(
 	case concat:
 		uint32_t vertex = j / n_features;
 
-		if (vertex >= 3) {
+		if (vertex >= 1) {
 			// Positional Component
 			const T v = w0 * (T)vertices[3 * f0 + (j % 3)] + w1 * (T)vertices[3 * f1 + (j % 3)] + w2 * (T)vertices[3 * f2 + (j % 3)];
 			const uint32_t log2_frequency = (j / 2) % n_frequencies;
@@ -121,8 +121,9 @@ __global__ void vertex_encoding(
 		}
 		else {
 			// Feature Component
-			uint32_t f = indices[3 * faceId + vertex].vertex_index;
-			data_out(j, i) = features[n_features * f + (j % n_features)];
+			
+			// Interpolate feature vectors
+			data_out(j, i) = w0 * features[n_features * f0 + j] + w1 * features[n_features * f1 + j] + w2 * features[n_features * f2 + j];
 		}
 
 		break;
@@ -168,19 +169,21 @@ __global__ void vertex_encoding_backward(
 
 	T gradient;
 
+	// Look up vertex IDs
+	uint32_t f0 = indices[3 * faceId + 0].vertex_index;
+	uint32_t f1 = indices[3 * faceId + 1].vertex_index;
+	uint32_t f2 = indices[3 * faceId + 2].vertex_index;
+	assert(f0 < n_vertices);
+	assert(f1 < n_vertices);
+	assert(f2 < n_vertices);
+
 	switch (constr) {
 
 		/*
 			LINEAR INTERPOLATION
 		*/
 	case lin_interp:
-		// Look up vertex IDs
-		uint32_t f0 = indices[3 * faceId + 0].vertex_index;
-		uint32_t f1 = indices[3 * faceId + 1].vertex_index;
-		uint32_t f2 = indices[3 * faceId + 2].vertex_index;
-		assert(f0 < n_vertices);
-		assert(f1 < n_vertices);
-		assert(f2 < n_vertices);
+		
 
 		gradient = dL_dy(j, i);
 		atomicAdd(&features[n_features * f0 + j], -gradient * w0);
@@ -192,13 +195,13 @@ __global__ void vertex_encoding_backward(
 			CONCATENATION
 		*/
 	case concat:
-		if (j >= n_features * 3)
+		if (j >= n_features)
 			break;
-		uint32_t vertex = j / n_features;
-		uint32_t f = indices[3 * faceId + vertex].vertex_index;
 
 		gradient = dL_dy(j, i);
-		atomicAdd(&features[n_features * f + (j % n_features)], -gradient);
+		atomicAdd(&features[n_features * f0 + j], -gradient * w0);
+		atomicAdd(&features[n_features * f1 + j], -gradient * w1);
+		atomicAdd(&features[n_features * f2 + j], -gradient * w2);
 		break;
 	}
 
@@ -217,7 +220,7 @@ public:
 			m_n_output_dims = n_features;
 			break;
 		case concat:
-			m_n_output_dims = 3 * n_features + m_n_frequencies;
+			m_n_output_dims = n_features + m_n_frequencies;
 			break;
 		default:
 			m_n_output_dims = n_features;
@@ -356,7 +359,7 @@ private:
 	OutputConstruction m_output_construction;
 
 	uint32_t m_n_dims_to_encode;
-	uint32_t m_n_frequencies = 12;
+	uint32_t m_n_frequencies = 24;
 	uint32_t m_n_params;
 	uint32_t m_n_features;
 	uint32_t m_n_vertices;
