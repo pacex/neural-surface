@@ -50,6 +50,53 @@ namespace tcnn {
 enum OutputConstruction { lin_interp, concat };
 
 template <typename T>
+struct FeatureRef{
+	uint32_t f0;
+	uint32_t f1;
+	uint32_t f2;
+	T w0;
+	T w1;
+	T w2;
+};
+
+template <typename T>
+__device__ FeatureRef<T> computeFeatureRef(uint32_t v0, uint32_t v1, uint32_t v2, T w0, T w1, T w2, uint32_t level, uint32_t* offset, uint32_t n_vertices) {
+
+	// Get local Barycentric Coordinates on sub triangle
+	T w0_local = (T)std::fmodf((T)(level + 1) * w0, 1.0f);
+	T w1_local = (T)std::fmodf((T)(level + 1) * w1, 1.0f);
+	T w2_local = (T)std::fmodf((T)(level + 1) * w2, 1.0f);
+
+	uint32_t w0_low = static_cast<uint32_t>(std::floorf(w0_local));
+	uint32_t w0_high = static_cast<uint32_t>(std::ceilf(w0_local));
+	uint32_t w1_low = static_cast<uint32_t>(std::floorf(w1_local));
+	uint32_t w1_high = static_cast<uint32_t>(std::ceilf(w1_local));
+	uint32_t w2_low = static_cast<uint32_t>(std::floorf(w2_local));
+	uint32_t w2_high = static_cast<uint32_t>(std::ceilf(w2_local));
+
+	uint32_t vertices_adj_local_aligned_unaligned[2][9] = { { w0_low, w1_high, w2_high, w0_high, w1_low, w2_high, w0_high, w1_high, w2_low },
+															{ w0_high, w1_low, w2_low, w0_low, w1_high, w2_low, w0_low, w1_low, w2_high} };
+
+	bool edgeAligned = (w0_low + w1_low + w2_low) % 2 == level % 2;
+	uint32_t* vertices_adj_local;
+	vertices_adj_local = vertices_adj_local_aligned_unaligned[edgeAligned];
+
+	uint32_t n_f = (level + 1) * (level + 1) * n_vertices;
+
+	FeatureRef<T> result;
+	result.f0 = ((v0 * vertices_adj_local[0] + v1 * vertices_adj_local[1] + v2 * vertices_adj_local[2]) % n_f) + offset[level];
+	result.f1 = ((v0 * vertices_adj_local[3] + v1 * vertices_adj_local[4] + v2 * vertices_adj_local[5]) % n_f) + offset[level];
+	result.f2 = ((v0 * vertices_adj_local[6] + v1 * vertices_adj_local[7] + v2 * vertices_adj_local[8]) % n_f) + offset[level];
+
+	result.w0 = (T)edgeAligned * w0_local + (T)!edgeAligned * ((T)1.0f - w0_local);
+	result.w1 = (T)edgeAligned * w1_local + (T)!edgeAligned * ((T)1.0f - w1_local);
+	result.w2 = (T)edgeAligned * w2_local + (T)!edgeAligned * ((T)1.0f - w2_local);
+
+	return result;
+}
+
+
+template <typename T>
 __global__ void vertex_encoding(
 	const uint32_t num_instances,
 	const uint32_t n_features,
@@ -63,11 +110,12 @@ __global__ void vertex_encoding(
 	tinyobj::index_t* indices,
 	float* vertices,
 	T* features,
+	uint32_t* offset,
 	MatrixView<const float> data_in,
 	MatrixView<T> data_out)
 {
 	const uint32_t encoded_index = blockIdx.x * blockDim.x + threadIdx.x;
-	const uint32_t level = blockIdx.y;
+	const uint32_t level = blockIdx.y; // number of _added_ features per edge
 
 	const uint32_t i = encoded_index / n_features;
 	const uint32_t j = encoded_index - i * n_features + level * n_features;
@@ -92,22 +140,25 @@ __global__ void vertex_encoding(
 	uint32_t faceId = *((uint32_t*)&data_in(0, i));
 	assert(faceId < n_faces);
 
-	// Get local Barycentric Coordinates on sub triangle
-	T w0 = (T)std::fmodf((level + 1) * data_in(1, i), 1.0f);
-	T w1 = (T)std::fmodf((level + 1) * data_in(2, i), 1.0f);
-	T w2 = (T)std::fmodf((T)(level + 1) * ((T)1.0f - w0 - w1), 1.0f);
+	T w0 = (T)data_in(1, i);
+	T w1 = (T)data_in(2, i);
+	T w2 = (T)1.0f - w0 - w1;
 
 
-	// Look up vertex IDs
-	uint32_t f0 = indices[3 * faceId + 0].vertex_index;
-	uint32_t f1 = indices[3 * faceId + 1].vertex_index;
-	uint32_t f2 = indices[3 * faceId + 2].vertex_index;
+	FeatureRef<T> fRef = computeFeatureRef(indices[3 * faceId + 0].vertex_index,
+		indices[3 * faceId + 1].vertex_index,
+		indices[3 * faceId + 2].vertex_index,
+		w0, w1, w2, level, offset, n_vertices);
+
+	
 
 	switch (constr) {
 	case lin_interp:
 	
 		// Interpolate feature vectors
-		data_out(j, i) = w0 * features[n_features * f0 + feature_entry] + w1 * features[n_features * f1 + feature_entry] + w2 * features[n_features * f2 + feature_entry];
+		data_out(j, i) = fRef.w0 * features[n_features * fRef.f0 + feature_entry]
+			+ fRef.w1 * features[n_features * fRef.f1 + feature_entry]
+			+ fRef.w2 * features[n_features * fRef.f2 + feature_entry];
 
 		break;
 
@@ -116,7 +167,7 @@ __global__ void vertex_encoding(
 
 		if (vertex >= 3) {
 			// Positional Component
-			const T v = w0 * (T)vertices[3 * f0 + (j % 3)] + w1 * (T)vertices[3 * f1 + (j % 3)] + w2 * (T)vertices[3 * f2 + (j % 3)];
+			const T v = fRef.w0 * (T)vertices[3 * fRef.f0 + (j % 3)] + fRef.w1 * (T)vertices[3 * fRef.f1 + (j % 3)] + fRef.w2 * (T)vertices[3 * fRef.f2 + (j % 3)];
 			const uint32_t log2_frequency = (j / 2) % n_frequencies;
 
 			const float phase_shift = (j % 2) * (PI / 2);
@@ -149,6 +200,7 @@ __global__ void vertex_encoding_backward(
 	const OutputConstruction constr,
 	tinyobj::index_t* indices,
 	T* features,
+	uint32_t* offset,
 	MatrixView<const float> data_in,
 	MatrixView<const T> dL_dy,
 	const float* dy_dx
@@ -180,10 +232,10 @@ __global__ void vertex_encoding_backward(
 
 	T gradient;
 
-	// Look up vertex IDs
-	uint32_t f0 = indices[3 * faceId + 0].vertex_index;
-	uint32_t f1 = indices[3 * faceId + 1].vertex_index;
-	uint32_t f2 = indices[3 * faceId + 2].vertex_index;
+	FeatureRef<T> fRef = computeFeatureRef(indices[3 * faceId + 0].vertex_index,
+		indices[3 * faceId + 1].vertex_index,
+		indices[3 * faceId + 2].vertex_index,
+		w0, w1, w2, level, offset, n_vertices);
 
 	switch (constr) {
 
@@ -192,9 +244,9 @@ __global__ void vertex_encoding_backward(
 		*/
 	case lin_interp:
 		gradient = dL_dy(j, i);
-		atomicAdd(&features[n_features * f0 + feature_entry], -gradient * w0);
-		atomicAdd(&features[n_features * f1 + feature_entry], -gradient * w1);
-		atomicAdd(&features[n_features * f2 + feature_entry], -gradient * w2);
+		atomicAdd(&features[n_features * fRef.f0 + feature_entry], -gradient * fRef.w0);
+		atomicAdd(&features[n_features * fRef.f1 + feature_entry], -gradient * fRef.w1);
+		atomicAdd(&features[n_features * fRef.f2 + feature_entry], -gradient * fRef.w2);
 		break;
 
 		/*
@@ -292,6 +344,7 @@ public:
 			m_indices.data(),
 			m_vertices.data(),
 			use_inference_params ? this->inference_params() : this->params(),
+			m_offset.data(),
 			input.view(),
 			output->view()
 			);
@@ -331,6 +384,7 @@ public:
 			m_output_construction,
 			m_indices.data(),
 			use_inference_params ? this->inference_params() : this->params(),
+			m_offset.data(),
 			input.view(),
 			dL_doutput.view(),
 			forward.dy_dx.data()
