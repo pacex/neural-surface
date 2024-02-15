@@ -60,19 +60,19 @@ struct FeatureRef{
 };
 
 template <typename T>
-__device__ FeatureRef<T> computeFeatureRef(uint32_t v0, uint32_t v1, uint32_t v2, T w0, T w1, T w2, uint32_t level, uint32_t* offset, uint32_t n_vertices) {
+__device__ FeatureRef<T> computeFeatureRef(uint32_t faceId, T w0, T w1, T w2, uint32_t level, uint32_t* offset, uint32_t face_stride) {
 
 	// Get local Barycentric Coordinates on sub triangle
 	T w0_local = (T)std::fmodf((T)(level + 1) * w0, 1.0f);
 	T w1_local = (T)std::fmodf((T)(level + 1) * w1, 1.0f);
 	T w2_local = (T)std::fmodf((T)(level + 1) * w2, 1.0f);
 
-	uint32_t w0_low = static_cast<uint32_t>(std::floorf(w0_local));
-	uint32_t w0_high = static_cast<uint32_t>(std::ceilf(w0_local));
-	uint32_t w1_low = static_cast<uint32_t>(std::floorf(w1_local));
-	uint32_t w1_high = static_cast<uint32_t>(std::ceilf(w1_local));
-	uint32_t w2_low = static_cast<uint32_t>(std::floorf(w2_local));
-	uint32_t w2_high = static_cast<uint32_t>(std::ceilf(w2_local));
+	uint32_t w0_low = static_cast<uint32_t>(std::floorf((T)(level + 1) * w0));
+	uint32_t w0_high = static_cast<uint32_t>(std::ceilf((T)(level + 1) * w0));
+	uint32_t w1_low = static_cast<uint32_t>(std::floorf((T)(level + 1) * w1));
+	uint32_t w1_high = static_cast<uint32_t>(std::ceilf((T)(level + 1) * w1));
+	uint32_t w2_low = static_cast<uint32_t>(std::floorf((T)(level + 1) * w2));
+	uint32_t w2_high = static_cast<uint32_t>(std::ceilf((T)(level + 1) * w2));
 
 	uint32_t vertices_adj_local_aligned_unaligned[2][9] = { { w0_low, w1_high, w2_high, w0_high, w1_low, w2_high, w0_high, w1_high, w2_low },
 															{ w0_high, w1_low, w2_low, w0_low, w1_high, w2_low, w0_low, w1_low, w2_high} };
@@ -81,12 +81,23 @@ __device__ FeatureRef<T> computeFeatureRef(uint32_t v0, uint32_t v1, uint32_t v2
 	uint32_t* vertices_adj_local;
 	vertices_adj_local = vertices_adj_local_aligned_unaligned[edgeAligned];
 
-	uint32_t n_f = (level + 1) * (level + 1) * n_vertices;
-
 	FeatureRef<T> result;
-	result.f0 = ((v0 * vertices_adj_local[0] + v1 * vertices_adj_local[1] + v2 * vertices_adj_local[2]) % n_f) + offset[level];
-	result.f1 = ((v0 * vertices_adj_local[3] + v1 * vertices_adj_local[4] + v2 * vertices_adj_local[5]) % n_f) + offset[level];
-	result.f2 = ((v0 * vertices_adj_local[6] + v1 * vertices_adj_local[7] + v2 * vertices_adj_local[8]) % n_f) + offset[level];
+
+	uint32_t invW0, W1, level_offset;
+
+	uint32_t n = level - 1;
+	level_offset = (level > 0) ? (n + 1) * (n * n + 8 * n + 18) / 6 : 0;
+
+	invW0 = (level + 1) - vertices_adj_local[0];
+	W1 = vertices_adj_local[1];
+	result.f0 = offset[faceId * face_stride + level_offset + (invW0 * (invW0 + 1) / 2 + W1)];
+	invW0 = (level + 1) - vertices_adj_local[3];
+	W1 = vertices_adj_local[4];
+	result.f1 = offset[faceId * face_stride + level_offset + (invW0 * (invW0 + 1) / 2 + W1)];
+	invW0 = (level + 1) - vertices_adj_local[6];
+	W1 = vertices_adj_local[7];
+	result.f2 = offset[faceId * face_stride + level_offset + (invW0 * (invW0 + 1) / 2 + W1)];
+
 
 	result.w0 = (T)edgeAligned * w0_local + (T)!edgeAligned * ((T)1.0f - w0_local);
 	result.w1 = (T)edgeAligned * w1_local + (T)!edgeAligned * ((T)1.0f - w1_local);
@@ -144,11 +155,9 @@ __global__ void vertex_encoding(
 	T w1 = (T)data_in(2, i);
 	T w2 = (T)1.0f - w0 - w1;
 
-
-	FeatureRef<T> fRef = computeFeatureRef(indices[3 * faceId + 0].vertex_index,
-		indices[3 * faceId + 1].vertex_index,
-		indices[3 * faceId + 2].vertex_index,
-		w0, w1, w2, level, offset, n_vertices);
+	uint32_t n = n_levels - 1;
+	FeatureRef<T> fRef = computeFeatureRef(faceId,
+		w0, w1, w2, level, offset, (n + 1) * (n * n + 8 * n + 18) / 6);
 
 	
 
@@ -232,10 +241,9 @@ __global__ void vertex_encoding_backward(
 
 	T gradient;
 
-	FeatureRef<T> fRef = computeFeatureRef(indices[3 * faceId + 0].vertex_index,
-		indices[3 * faceId + 1].vertex_index,
-		indices[3 * faceId + 2].vertex_index,
-		w0, w1, w2, level, offset, n_vertices);
+	uint32_t n = n_levels - 1;
+	FeatureRef<T> fRef = computeFeatureRef(faceId,
+		w0, w1, w2, level, offset, (n + 1) * (n * n + 8 * n + 18) / 6);
 
 	switch (constr) {
 
@@ -270,11 +278,12 @@ template <typename T>
 class VertexEncoding : public Encoding<T> {
 public:
 	// TODO: remove n_faces parameter
-	VertexEncoding(uint32_t n_features, uint32_t n_dims_to_encode, uint32_t n_vertices, uint32_t n_faces, OutputConstruction output_construction, std::vector<tinyobj::index_t> indices, std::vector<float> vertices)
-		: m_n_features{ n_features }, m_n_dims_to_encode{ n_dims_to_encode }, m_n_vertices{ n_vertices }, m_n_faces{ n_faces }, m_output_construction{ output_construction }
+	VertexEncoding(uint32_t n_features, uint32_t n_levels, uint32_t n_dims_to_encode, uint32_t n_vertices, uint32_t n_faces, OutputConstruction output_construction, std::vector<tinyobj::index_t> indices, std::vector<float> vertices)
+		: m_n_features{ n_features }, m_n_levels{ n_levels }, m_n_dims_to_encode { n_dims_to_encode}, m_n_vertices{ n_vertices }, m_n_faces{ n_faces }, m_output_construction{ output_construction }
 	{
+		printf("Vertex Encoding with %i feature vector entries and %i feature hierarchy levels.\n", m_n_features, m_n_levels);
 
-		m_n_levels = 16;
+		// TODO: implement hashing
 		m_max_features_per_level = 16 * n_vertices;
 
 		switch (m_output_construction) {
@@ -294,21 +303,9 @@ public:
 		m_vertices = GPUMemory<float>(vertices.size());
 		m_vertices.copy_from_host(vertices);
 
-		std::vector<uint32_t> offsets(m_n_levels);
-
-		uint32_t offset = 0;
-
-		for (size_t i = 0; i < m_n_levels; i++) {
-			offsets[i] = offset;
-			offset += std::min<uint32_t>(m_max_features_per_level * n_features, (i + 1) * (i + 1) * n_vertices * n_features);
-		}
-
-		m_offset = GPUMemory<uint32_t>(offsets.size());
-		m_offset.copy_from_host(offsets);
-
-		m_n_params = offset;
-
-		computeFeatureOffset(indices);
+		uint32_t nF;
+		m_offset = computeFeatureOffset(indices, &nF);
+		m_n_params = nF * n_features;
 	}
 
 	std::unique_ptr<Context> forward_impl(
@@ -469,7 +466,7 @@ private:
 	uint32_t m_n_output_dims;
 	uint32_t m_n_to_pad = 0;
 
-	GPUMemory<uint32_t> computeFeatureOffset(std::vector<tinyobj::index_t> indices) {
+	GPUMemory<uint32_t> computeFeatureOffset(std::vector<tinyobj::index_t> indices, uint32_t* n_params) {
 		uint32_t n = m_n_levels - 1;
 		uint32_t face_stride = (n + 1) * (n * n + 8 * n + 18) / 6;
 		std::vector<uint32_t> offset_host(m_n_faces * face_stride);
@@ -549,7 +546,7 @@ private:
 			level_offset += n_features_level;
 		}
 
-		
+		*n_params = unique_feature;
 
 		GPUMemory<uint32_t> offset(offset_host.size());
 		offset.copy_from_host(offset_host);
@@ -569,7 +566,7 @@ VertexEncoding<T>* create_vertex_encoding(uint32_t n_dims_to_encode, uint32_t n_
 	else
 		output_construction = lin_interp;
 
-	return new VertexEncoding<T>(encoding.value("n_features", 2u), n_dims_to_encode, n_vertices, n_faces, output_construction, indices, vertices);
+	return new VertexEncoding<T>(encoding.value("n_features", 2u), encoding.value("n_levels", 1u), n_dims_to_encode, n_vertices, n_faces, output_construction, indices, vertices);
 }
 
 }
