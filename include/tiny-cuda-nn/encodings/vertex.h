@@ -274,7 +274,7 @@ public:
 		: m_n_features{ n_features }, m_n_dims_to_encode{ n_dims_to_encode }, m_n_vertices{ n_vertices }, m_n_faces{ n_faces }, m_output_construction{ output_construction }
 	{
 
-		m_n_levels = 1;
+		m_n_levels = 16;
 		m_max_features_per_level = 16 * n_vertices;
 
 		switch (m_output_construction) {
@@ -307,6 +307,8 @@ public:
 		m_offset.copy_from_host(offsets);
 
 		m_n_params = offset;
+
+		computeFeatureOffset(indices);
 	}
 
 	std::unique_ptr<Context> forward_impl(
@@ -461,10 +463,98 @@ private:
 	GPUMemory<tinyobj::index_t> m_indices;
 	GPUMemory<float> m_vertices;
 	GPUMemory<uint32_t> m_offset;
+	GPUMemory<uint32_t> m_feature_offset;
 
 	// derived sizes
 	uint32_t m_n_output_dims;
 	uint32_t m_n_to_pad = 0;
+
+	GPUMemory<uint32_t> computeFeatureOffset(std::vector<tinyobj::index_t> indices) {
+		uint32_t n = m_n_levels - 1;
+		uint32_t face_stride = (n + 1) * (n * n + 8 * n + 18) / 6;
+		std::vector<uint32_t> offset_host(m_n_faces * face_stride);
+
+		uint32_t level_offset = 0;
+		uint32_t unique_feature = 0;
+
+
+		for (size_t l = 0; l < m_n_levels; l++) { // Iterate over subdivision levels, l=0: no subdivision
+
+			uint32_t n_features_level = (l + 2) * (l + 3) / 2;
+
+			std::vector<uint32_t> verts(m_n_vertices);
+			for (size_t i = 0; i < m_n_vertices; i++)
+				verts[i] = 0xffffffff;
+
+			std::vector<uint32_t> edges(m_n_vertices * m_n_vertices * l);
+			for (size_t i = 0; i < m_n_vertices * m_n_vertices * l; i++)
+				edges[i] = 0xffffffff;
+
+			for (size_t j = 0; j < m_n_faces; j++) { // At each level: Iterate over faces
+
+				uint32_t v0 = indices[3 * j + 0].vertex_index;
+				uint32_t v1 = indices[3 * j + 1].vertex_index;
+				uint32_t v2 = indices[3 * j + 2].vertex_index;
+
+				for (size_t f = 0; f < n_features_level; f++) { // For each face, at each subdivision level: iterate over all features within it
+
+					// Compute integer barycentric feature identifiers
+					uint32_t invW0 = std::floorf(-0.5f + std::sqrtf(0.25f + 2 * f));
+					uint32_t W0 = (l + 1) - invW0;
+					uint32_t W1 = f - (invW0 * (invW0 + 1) / 2);
+					uint32_t W2 = (l + 1) - W0 - W1;
+					assert(W0 + W1 + W2 == (l + 1));
+
+					// TODO: offset_host[j * face_stride + level_offset + f] = >>offset to feature entry<<
+
+					// Shared feature at vertex
+					if (W0 == (l + 1) || W1 == (l + 1) || W2 == (l+1)) {
+						uint32_t v = W0 > 0 ? v0 : (W1 > 0 ? v1 : v2);
+						if (verts[v] == 0xffffffff) {
+							offset_host[j * face_stride + level_offset + f] = unique_feature;
+							verts[v] = unique_feature;
+							unique_feature++;
+						}
+						else {
+							offset_host[j * face_stride + level_offset + f] = verts[v];
+						}
+					}
+
+					// Shared feature at edge
+					else if (W0 == 0 || W1 == 0 || W2 == 0) {
+						uint32_t e0 = W0 == 0 ? std::max(v1, v2) : (W1 == 0 ? std::max(v0, v2) : std::max(v0, v1));
+						uint32_t e1 = W0 == 0 ? std::min(v1, v2) : (W1 == 0 ? std::min(v0, v2) : std::min(v0, v1));
+						uint32_t W = e0 == v0 ? W0 : (e0 == v1 ? W1 : W2);
+
+						if (edges[e0 * m_n_vertices * l + e1 * l + W - 1] == 0xffffffff) {
+							offset_host[j * face_stride + level_offset + f] = unique_feature;
+							edges[e0 * m_n_vertices * l + e1 * l + W - 1] = unique_feature;
+							unique_feature++;
+						}
+						else {
+							offset_host[j * face_stride + level_offset + f] = edges[e0 * m_n_vertices * l + e1 * l + W - 1];
+						}
+					}
+
+					// Non-shared feature
+					else {
+						offset_host[j * face_stride + level_offset + f] = unique_feature;
+						unique_feature++;
+					}
+
+					assert(level_offset + f < face_stride);
+				}
+			}
+
+			level_offset += n_features_level;
+		}
+
+		
+
+		GPUMemory<uint32_t> offset(offset_host.size());
+		offset.copy_from_host(offset_host);
+		return offset;
+	}
 };
 
 template <typename T>

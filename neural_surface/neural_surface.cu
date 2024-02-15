@@ -353,9 +353,9 @@ int main(int argc, char* argv[]) {
 		*  =========================
 		*/
 
-		std::string object_path = "data/objects/simple_subdiv.obj";
+		std::string object_path = "data/objects/simple.obj";
 		std::string texture_path = "data/objects/dice_texture.jpg";
-		std::string sample_path = "data/objects/sample_subdiv.csv";
+		std::string sample_path = "data/objects/sample.csv";
 
 
 		/* ======================
