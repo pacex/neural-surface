@@ -66,11 +66,7 @@ __device__ FeatureRef<T> computeFeatureRef(uint32_t faceId, T w0, T w1, T w2, ui
 	uint32_t level_offset = meta[1 + 2 * level];
 	uint32_t n_subdiv = meta[1 + 2 * level + 1];
 
-	// Get local Barycentric Coordinates on sub triangle
-	T w0_local = (T)std::fmodf((T)(n_subdiv + 1) * w0, 1.0f);
-	T w1_local = (T)std::fmodf((T)(n_subdiv + 1) * w1, 1.0f);
-	T w2_local = (T)std::fmodf((T)(n_subdiv + 1) * w2, 1.0f);
-
+	// Compute 'barycentric' identifiers to feature vectors at adjacent vertices
 	uint32_t w0_low = static_cast<uint32_t>(std::floorf((T)(n_subdiv + 1) * w0));
 	uint32_t w0_high = static_cast<uint32_t>(std::ceilf((T)(n_subdiv + 1) * w0));
 	uint32_t w1_low = static_cast<uint32_t>(std::floorf((T)(n_subdiv + 1) * w1));
@@ -78,6 +74,7 @@ __device__ FeatureRef<T> computeFeatureRef(uint32_t faceId, T w0, T w1, T w2, ui
 	uint32_t w2_low = static_cast<uint32_t>(std::floorf((T)(n_subdiv + 1) * w2));
 	uint32_t w2_high = static_cast<uint32_t>(std::ceilf((T)(n_subdiv + 1) * w2));
 
+	// adjacent 'sub-vertices' depend on if sub triangle is edge aligned to original triangle
 	uint32_t vertices_adj_local_aligned_unaligned[2][9] = { { w0_low, w1_high, w2_high, w0_high, w1_low, w2_high, w0_high, w1_high, w2_low },
 															{ w0_high, w1_low, w2_low, w0_low, w1_high, w2_low, w0_low, w1_low, w2_high} };
 
@@ -85,6 +82,10 @@ __device__ FeatureRef<T> computeFeatureRef(uint32_t faceId, T w0, T w1, T w2, ui
 	uint32_t* vertices_adj_local;
 	vertices_adj_local = vertices_adj_local_aligned_unaligned[edgeAligned];
 
+	/* For all three adjacent feature vectors:
+	*	- compute their position in the offset buffer from 'barycentric' identifiers
+	*	- look up feature vector offset from precomputed buffer
+	*/
 	FeatureRef<T> result;
 	uint32_t invW0, W1;
 
@@ -98,6 +99,10 @@ __device__ FeatureRef<T> computeFeatureRef(uint32_t faceId, T w0, T w1, T w2, ui
 	W1 = vertices_adj_local[7];
 	result.f2 = offset[faceId * face_stride + level_offset + (invW0 * (invW0 + 1) / 2 + W1)];
 
+	// Compute local barycentric coordinates on sub triangle
+	T w0_local = (T)std::fmodf((T)(n_subdiv + 1) * w0, 1.0f);
+	T w1_local = (T)std::fmodf((T)(n_subdiv + 1) * w1, 1.0f);
+	T w2_local = (T)std::fmodf((T)(n_subdiv + 1) * w2, 1.0f);
 
 	result.w0 = (T)edgeAligned * w0_local + (T)!edgeAligned * ((T)1.0f - w0_local);
 	result.w1 = (T)edgeAligned * w1_local + (T)!edgeAligned * ((T)1.0f - w1_local);
@@ -150,7 +155,6 @@ __global__ void vertex_encoding(
 
 	// Decode face id
 	uint32_t faceId = *((uint32_t*)&data_in(0, i));
-	assert(faceId < n_faces);
 
 	T w0 = (T)data_in(1, i);
 	T w1 = (T)data_in(2, i);
@@ -233,7 +237,6 @@ __global__ void vertex_encoding_backward(
 
 	// Decode face id
 	uint32_t faceId = *((uint32_t*)&data_in(0, i));
-	assert(faceId < n_faces);
 
 	// Get Barycentric Coordinates
 	T w0 = data_in(1, i);
@@ -303,9 +306,7 @@ public:
 		m_vertices = GPUMemory<float>(vertices.size());
 		m_vertices.copy_from_host(vertices);
 
-		uint32_t nF;
-		m_offset = computeFeatureOffset(indices, &nF, &m_metadata);
-		m_n_params = nF * n_features;
+		m_n_params = computeFeatureOffset(indices, &m_offset, &m_metadata) * n_features;
 		printf("Using %i unique feature entries.\n", m_n_params);
 	}
 
@@ -469,24 +470,43 @@ private:
 	uint32_t m_n_output_dims;
 	uint32_t m_n_to_pad = 0;
 
-	GPUMemory<uint32_t> computeFeatureOffset(std::vector<tinyobj::index_t> indices, uint32_t* n_params, GPUMemory<uint32_t>* meta) {
+	uint32_t computeFeatureOffset(std::vector<tinyobj::index_t> indices, GPUMemory<uint32_t>* offset, GPUMemory<uint32_t>* meta) {
 
+		/* Precompute offset of feature vectors in memory
+		*
+		* offset layout:
+		* |0		|face_stride	|2*face_stride	... |n_faces*face_stride	|
+		*			/				\
+		*			|f_00 f_01 f_02|f_10 f_11 ... f_1n_features_level|...
+		*
+		* (f_ij * n_features) serves as index to feature vector in params
+		*
+		* metadata layout:
+		* |face_stride level_offset_0 n_subdiv_0 level_offset_1 n_subdiv_1 ... level_offset_n-1 n_subdiv_n-1|
+		*
+		* returns number of unique feature vectors
+		*/
+
+		// TODO: hashing
+
+		// TODO: make this hyperparam
 		auto level_subdiv = [](uint32_t l) {
 			return std::pow(2, l) - 1;
 		};
 
-		uint32_t face_stride = 0;
+	
+		uint32_t face_stride = 0; // How many feature offsets need to be stored per face
 		for (size_t l = 0; l < m_n_levels; l++) {
 			uint32_t n = level_subdiv(l);
 			face_stride += (n + 2) * (n + 3) / 2;
 		}
 
-		std::vector<uint32_t> offset_host(m_n_faces * face_stride);
-		std::vector<uint32_t> meta_host(1 + m_n_levels * 2);
+		std::vector<uint32_t> offset_host(m_n_faces * face_stride);	// Offset buffer
+		std::vector<uint32_t> meta_host(1 + m_n_levels * 2);		// Metadata buffer
 		meta_host[0] = face_stride;
 
 		uint32_t level_offset = 0;
-		uint32_t unique_feature = 0;
+		uint32_t unique_feature = 0;	// Index of next unique feature vector
 
 
 		for (size_t l = 0; l < m_n_levels; l++) { // Iterate over subdivision levels, l=0: no subdivision
@@ -496,8 +516,9 @@ private:
 			meta_host[1 + 2 * l + 1] = n_subdiv;
 
 
-			uint32_t n_features_level = (n_subdiv + 2) * (n_subdiv + 3) / 2;
+			uint32_t n_features_level = (n_subdiv + 2) * (n_subdiv + 3) / 2; // #feature vectors per face on level l
 
+			// temp storage for indices to feature vectors that are shared across faces at vertices or along edges
 			std::vector<uint32_t> verts(m_n_vertices);
 			for (size_t i = 0; i < m_n_vertices; i++)
 				verts[i] = 0xffffffff;
@@ -514,7 +535,7 @@ private:
 
 				for (size_t f = 0; f < n_features_level; f++) { // For each face, at each subdivision level: iterate over all features within it
 
-					// Compute integer barycentric feature identifiers
+					// Compute integer 'barycentric' feature identifiers
 					uint32_t invW0 = std::floorf(-0.5f + std::sqrtf(0.25f + 2 * f));
 					uint32_t W0 = (n_subdiv + 1) - invW0;
 					uint32_t W1 = f - (invW0 * (invW0 + 1) / 2);
@@ -524,12 +545,12 @@ private:
 					// Shared feature at vertex
 					if (W0 == (n_subdiv + 1) || W1 == (n_subdiv + 1) || W2 == (n_subdiv + 1)) {
 						uint32_t v = W0 > 0 ? v0 : (W1 > 0 ? v1 : v2);
-						if (verts[v] == 0xffffffff) {
+						if (verts[v] == 0xffffffff) { // Not seen before -> assign new unique feature
 							offset_host[j * face_stride + level_offset + f] = unique_feature;
 							verts[v] = unique_feature;
 							unique_feature++;
 						}
-						else {
+						else { // Seen before -> reference assigned feature
 							offset_host[j * face_stride + level_offset + f] = verts[v];
 						}
 					}
@@ -540,17 +561,17 @@ private:
 						uint32_t e1 = W0 == 0 ? std::min(v1, v2) : (W1 == 0 ? std::min(v0, v2) : std::min(v0, v1));
 						uint32_t W = e0 == v0 ? W0 : (e0 == v1 ? W1 : W2);
 
-						if (edges[e0 * m_n_vertices * n_subdiv + e1 * n_subdiv + W - 1] == 0xffffffff) {
+						if (edges[e0 * m_n_vertices * n_subdiv + e1 * n_subdiv + W - 1] == 0xffffffff) { // Not seen before -> assign new unique feature
 							offset_host[j * face_stride + level_offset + f] = unique_feature;
 							edges[e0 * m_n_vertices * n_subdiv + e1 * n_subdiv + W - 1] = unique_feature;
 							unique_feature++;
 						}
-						else {
+						else { // Seen before -> reference assigned feature
 							offset_host[j * face_stride + level_offset + f] = edges[e0 * m_n_vertices * n_subdiv + e1 * n_subdiv + W - 1];
 						}
 					}
 
-					// Non-shared feature
+					// Non-shared feature -> new unique feature
 					else {
 						offset_host[j * face_stride + level_offset + f] = unique_feature;
 						unique_feature++;
@@ -563,14 +584,12 @@ private:
 			level_offset += n_features_level;
 		}
 
-		*n_params = unique_feature;
-
-		GPUMemory<uint32_t> offset(offset_host.size());
-		offset.copy_from_host(offset_host);
+		*offset = GPUMemory<uint32_t>(offset_host.size());
+		offset->copy_from_host(offset_host);
 		*meta = GPUMemory<uint32_t>(meta_host.size());
 		meta->copy_from_host(meta_host);
 
-		return offset;
+		return unique_feature; // return #unique features
 	}
 };
 
