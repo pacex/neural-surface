@@ -329,8 +329,8 @@ int main(int argc, char* argv[]) {
 			}},
 			{"encoding", {
 				{"otype", "Vertex"},
-				{"n_features", 4},
-				{"n_levels", 8},
+				{"n_features", 8},
+				{"n_levels", 1},
 				{"output_construction", "lin_interp"},
 			}},
 			{"network", {
@@ -354,9 +354,9 @@ int main(int argc, char* argv[]) {
 		*  =========================
 		*/
 
-		std::string object_path = "data/objects/simple.obj";
-		std::string texture_path = "data/objects/dice_texture.jpg";
-		std::string sample_path = "data/objects/sample.csv";
+		std::string object_path = "data/objects/barramundifish.obj";
+		std::string texture_path = "data/objects/BarramundiFish_baseColor.png";
+		std::string sample_path = "data/objects/sample_fish.csv";
 
 
 		/* ======================
