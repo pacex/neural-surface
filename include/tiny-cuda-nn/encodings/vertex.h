@@ -51,12 +51,8 @@ enum OutputConstruction { lin_interp, concat };
 
 template <typename T>
 struct FeatureRef{
-	uint32_t f0;
-	uint32_t f1;
-	uint32_t f2;
-	T w0;
-	T w1;
-	T w2;
+	uint32_t f[3];
+	T w[3];
 };
 
 template <typename T>
@@ -91,22 +87,22 @@ __device__ FeatureRef<T> computeFeatureRef(uint32_t faceId, T w0, T w1, T w2, ui
 
 	invW0 = (n_subdiv + 1) - vertices_adj_local[0];
 	W1 = vertices_adj_local[1];
-	result.f0 = offset[faceId * face_stride + level_offset + (invW0 * (invW0 + 1) / 2 + W1)];
+	result.f[0] = offset[faceId * face_stride + level_offset + (invW0 * (invW0 + 1) / 2 + W1)];
 	invW0 = (n_subdiv + 1) - vertices_adj_local[3];
 	W1 = vertices_adj_local[4];
-	result.f1 = offset[faceId * face_stride + level_offset + (invW0 * (invW0 + 1) / 2 + W1)];
+	result.f[1] = offset[faceId * face_stride + level_offset + (invW0 * (invW0 + 1) / 2 + W1)];
 	invW0 = (n_subdiv + 1) - vertices_adj_local[6];
 	W1 = vertices_adj_local[7];
-	result.f2 = offset[faceId * face_stride + level_offset + (invW0 * (invW0 + 1) / 2 + W1)];
+	result.f[2] = offset[faceId * face_stride + level_offset + (invW0 * (invW0 + 1) / 2 + W1)];
 
 	// Compute local barycentric coordinates on sub triangle
 	T w0_local = (T)std::fmodf((T)(n_subdiv + 1) * w0, 1.0f);
 	T w1_local = (T)std::fmodf((T)(n_subdiv + 1) * w1, 1.0f);
 	T w2_local = (T)std::fmodf((T)(n_subdiv + 1) * w2, 1.0f);
 
-	result.w0 = (T)edgeAligned * w0_local + (T)!edgeAligned * ((T)1.0f - w0_local);
-	result.w1 = (T)edgeAligned * w1_local + (T)!edgeAligned * ((T)1.0f - w1_local);
-	result.w2 = (T)edgeAligned * w2_local + (T)!edgeAligned * ((T)1.0f - w2_local);
+	result.w[0] = (T)edgeAligned * w0_local + (T)!edgeAligned * ((T)1.0f - w0_local);
+	result.w[1] = (T)edgeAligned * w1_local + (T)!edgeAligned * ((T)1.0f - w1_local);
+	result.w[2] = (T)edgeAligned * w2_local + (T)!edgeAligned * ((T)1.0f - w2_local);
 
 	return result;
 }
@@ -117,6 +113,7 @@ __global__ void vertex_encoding(
 	const uint32_t num_instances,
 	const uint32_t n_features,
 	const uint32_t n_levels,
+	const uint32_t level_concat,
 	const uint32_t n_frequencies,
 	const uint32_t n_faces,
 	const uint32_t n_vertices,
@@ -132,10 +129,10 @@ __global__ void vertex_encoding(
 	MatrixView<T> data_out)
 {
 	const uint32_t encoded_index = blockIdx.x * blockDim.x + threadIdx.x;
-	const uint32_t level = blockIdx.y; // number of _added_ features per edge
+	const uint32_t level = std::min(blockIdx.y, level_concat) + std::max((int)(blockIdx.y - level_concat / 4), 0); // number of _added_ features per edge
 
 	const uint32_t i = encoded_index / n_features;
-	const uint32_t j = encoded_index - i * n_features + level * n_features;
+	const uint32_t j = encoded_index - i * n_features + blockIdx.y * n_features;
 
 	if (i >= num_instances) return;
 	if (j >= padded_output_width) return;
@@ -169,31 +166,39 @@ __global__ void vertex_encoding(
 	case lin_interp:
 	
 		// Interpolate feature vectors
-		data_out(j, i) = fRef.w0 * features[n_features * fRef.f0 + feature_entry]
-			+ fRef.w1 * features[n_features * fRef.f1 + feature_entry]
-			+ fRef.w2 * features[n_features * fRef.f2 + feature_entry];
+		data_out(j, i) = fRef.w[0] * features[n_features * fRef.f[0] + feature_entry]
+			+ fRef.w[1] * features[n_features * fRef.f[1] + feature_entry]
+			+ fRef.w[2] * features[n_features * fRef.f[2] + feature_entry];
 
 		break;
 
 	case concat:
-		uint32_t vertex = j / n_features;
-
-		if (vertex >= 3) {
-			// Positional Component
-			const T v = fRef.w0 * (T)vertices[3 * fRef.f0 + (j % 3)] + fRef.w1 * (T)vertices[3 * fRef.f1 + (j % 3)] + fRef.w2 * (T)vertices[3 * fRef.f2 + (j % 3)];
-			const uint32_t log2_frequency = (j / 2) % n_frequencies;
-
-			const float phase_shift = (j % 2) * (PI / 2);
-
-			const float x = scalbnf(v, log2_frequency);
-			const float input = x * PI + phase_shift;
-
-			data_out(j, i) = (T)__sinf(input);
+		assert(level < level_concat);
+		if (level < level_concat) {
+			// Interpolate feature vectors
+			data_out(j, i) = fRef.w[0] * features[n_features * fRef.f[0] + feature_entry]
+				+ fRef.w[1] * features[n_features * fRef.f[1] + feature_entry]
+				+ fRef.w[2] * features[n_features * fRef.f[2] + feature_entry];
 		}
 		else {
-			// Feature Component
-			uint32_t f = indices[3 * faceId + vertex].vertex_index;
-			data_out(j, i) = features[n_features * f + (j % n_features)];
+			uint32_t vertex = (blockIdx.y - level_concat) % 4;
+
+			if (vertex >= 3) {
+				// Positional Component
+				const T v = fRef.w[0] * (T)vertices[3 * fRef.f[0] + (j % 3)] + fRef.w[1] * (T)vertices[3 * fRef.f[1] + (j % 3)] + fRef.w[2] * (T)vertices[3 * fRef.f[2] + (j % 3)];
+				const uint32_t log2_frequency = (j / 3) % n_frequencies;
+
+				const float phase_shift = (j % 3) * (PI / 2);
+
+				const float x = scalbnf(v, log2_frequency);
+				const float input = x * PI + phase_shift;
+
+				data_out(j, i) = (T)__sinf(input);
+			}
+			else {
+				// Feature Component
+				data_out(j, i) = features[n_features * fRef.f[vertex] + (j % n_features)];
+			}
 		}
 
 		break;
@@ -208,6 +213,7 @@ __global__ void vertex_encoding_backward(
 	const uint32_t output_width,
 	const uint32_t n_features,
 	const uint32_t n_levels,
+	const uint32_t level_concat,
 	const uint32_t n_faces,
 	const uint32_t n_vertices,
 	const OutputConstruction constr,
@@ -221,10 +227,10 @@ __global__ void vertex_encoding_backward(
 	//MatrixView<float> dL_dx
 ) {
 	const uint32_t encoded_index = blockIdx.x * blockDim.x + threadIdx.x;
-	const uint32_t level = blockIdx.y;
+	const uint32_t level = std::min(blockIdx.y, level_concat) + std::max((int)(blockIdx.y - level_concat / 4), 0); // number of _added_ features per edge
 
 	const uint32_t i = encoded_index / n_features;
-	const uint32_t j = encoded_index - i * n_features + level * n_features;
+	const uint32_t j = encoded_index - i * n_features + blockIdx.y * n_features;
 
 	if (i >= num_instances) return;
 	if (j >= output_width) return;
@@ -255,22 +261,30 @@ __global__ void vertex_encoding_backward(
 		*/
 	case lin_interp:
 		gradient = dL_dy(j, i);
-		atomicAdd(&features[n_features * fRef.f0 + feature_entry], -gradient * fRef.w0);
-		atomicAdd(&features[n_features * fRef.f1 + feature_entry], -gradient * fRef.w1);
-		atomicAdd(&features[n_features * fRef.f2 + feature_entry], -gradient * fRef.w2);
+		atomicAdd(&features[n_features * fRef.f[0] + feature_entry], -gradient * fRef.w[0]);
+		atomicAdd(&features[n_features * fRef.f[1] + feature_entry], -gradient * fRef.w[1]);
+		atomicAdd(&features[n_features * fRef.f[2] + feature_entry], -gradient * fRef.w[2]);
 		break;
 
 		/*
 			CONCATENATION
 		*/
 	case concat:
-		if (j >= n_features * 3)
-			break;
-		uint32_t vertex = j / n_features;
-		uint32_t f = indices[3 * faceId + vertex].vertex_index;
-
 		gradient = dL_dy(j, i);
-		atomicAdd(&features[n_features * f + (j % n_features)], -gradient);
+		if (level < level_concat) {
+			atomicAdd(&features[n_features * fRef.f[0] + feature_entry], -gradient * fRef.w[0]);
+			atomicAdd(&features[n_features * fRef.f[1] + feature_entry], -gradient * fRef.w[1]);
+			atomicAdd(&features[n_features * fRef.f[2] + feature_entry], -gradient * fRef.w[2]);
+		}
+		else {
+			uint32_t vertex = (blockIdx.y - level_concat) % 4;
+
+			if (vertex < 3) {
+				// Feature Component
+				atomicAdd(&features[n_features * fRef.f[vertex] + (j % n_features)], -gradient);
+			}
+		}
+
 		break;
 	}
 
@@ -288,13 +302,15 @@ public:
 
 		// TODO: implement hashing
 		m_max_features_per_level = 16 * n_vertices;
+		m_level_concat = std::min(m_n_levels, 3u);
 
 		switch (m_output_construction) {
 		case lin_interp:
+			m_level_concat = m_n_levels;
 			m_n_output_dims = n_features * m_n_levels;
 			break;
 		case concat:
-			m_n_output_dims = 3 * n_features + m_n_frequencies;
+			m_n_output_dims = m_level_concat * n_features + (m_n_levels - m_level_concat) * 4 * n_features;
 			break;
 		default:
 			m_n_output_dims = n_features;
@@ -336,6 +352,7 @@ public:
 			input.n(),
 			m_n_features,
 			m_n_levels,
+			m_level_concat,
 			m_n_frequencies,
 			m_n_faces,
 			m_n_vertices,
@@ -381,6 +398,7 @@ public:
 			m_n_output_dims,
 			m_n_features,
 			m_n_levels,
+			m_level_concat,
 			m_n_faces,
 			m_n_vertices,
 			m_output_construction,
@@ -448,6 +466,7 @@ private:
 	};
 
 	OutputConstruction m_output_construction;		// Interpolate or concatenate feature vectors
+	uint32_t m_level_concat;						// Coarsest level where concatenation is applied instead of interpolation
 
 	uint32_t m_n_dims_to_encode;					// FaceId, w0, w1
 	
@@ -459,7 +478,7 @@ private:
 	uint32_t m_n_vertices;							
 	uint32_t m_n_faces;
 
-	uint32_t m_n_frequencies = 12;					// Number of frequencies to encode position in (only applied in concat mode)
+	uint32_t m_n_frequencies = 10;					// Number of frequencies to encode position in (only applied in concat mode)
 
 	GPUMemory<tinyobj::index_t> m_indices;
 	GPUMemory<float> m_vertices;
