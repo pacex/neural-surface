@@ -582,6 +582,10 @@ private:
 			}
 
 			level_offset += n_features_level;
+
+			// Fix memory alignment
+			uint32_t alignment = 1u << 3;	// not 100% sure what the memory alignment requirements are but this seems to work
+			unique_feature += (alignment - (unique_feature % alignment)) % alignment;
 		}
 
 		*offset = GPUMemory<uint32_t>(offset_host.size());

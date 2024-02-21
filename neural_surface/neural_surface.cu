@@ -329,8 +329,8 @@ int main(int argc, char* argv[]) {
 			}},
 			{"encoding", {
 				{"otype", "Vertex"},
-				{"n_features", 8},
-				{"n_levels", 1},
+				{"n_features", 1},
+				{"n_levels", 7},
 				{"output_construction", "lin_interp"},
 			}},
 			{"network", {
