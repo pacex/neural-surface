@@ -279,7 +279,7 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 		const uint32_t n_input_dims = N_INPUT_DIMS; // (v1, v2, v3, alpha, beta, gamma)
 		const uint32_t n_output_dims = N_OUTPUT_DIMS; // RGB color
 
-		const uint32_t n_training_steps = 6000;
+		const uint32_t n_training_steps = 5001;
 
 		cudaStream_t inference_stream;
 		CUDA_CHECK_THROW(cudaStreamCreate(&inference_stream));
@@ -319,7 +319,7 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 
 		for (uint32_t i = 0; i < n_training_steps; ++i) {
 			bool print_loss = i % interval == 0;
-			bool visualize_learned_func = (i % interval == 0) || (i == (n_training_steps - 1));
+			bool visualize_learned_func = /*(i % interval == 0) || */(i == (n_training_steps - 1));
 			bool writeEvalResult = i == (n_training_steps - 1);
 
 			/* ===============================
@@ -391,7 +391,7 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 
 					network->inference(inference_stream, inference_batch_raw, prediction);
 					std::vector<float> debug = prediction.to_cpu_vector();
-					auto filename = fmt::format("images/nl{}_nf{}_iter{}.jpg", encoding_opts.value("n_levels", 1u), encoding_opts.value("n_features", 2u), i);
+					auto filename = fmt::format("images/nl{}_nmf{}_iter{}.jpg", encoding_opts.value("n_levels", 1u), std::log2(encoding_opts.value("max_features_level", 1u << 14)), i);
 					std::cout << "Writing '" << filename << "'... ";
 					save_image(prediction.data(), sampleWidth, sampleHeight, 3, 3, filename);
 					std::cout << "done." << std::endl;
@@ -629,22 +629,28 @@ int main(int argc, char* argv[]) {
 
 
 	/* =========================
-		TRAINING END EVALUATION
+		TRAINING AND EVALUATION
 	   =========================
 	*/
 
-	uint32_t n_test_cases = 6;
+	uint32_t n_test_cases = 30;
 	//uint32_t ns_level[] = {   1,1,1,1,1, 1,		2,2,2,2,2, 2,	3,3,3,3,3, 3,	4,4,4,4,4, 4,	5,5,5,5,	6,6,6,	7,7 };
 	//uint32_t ns_feature[] = { 1,2,4,8,16,32,	1,2,4,8,16,32,	1,2,4,8,16,32,	1,2,4,8,16,32,	1,2,4,8,	1,2,4,	1,2 };
 
-	uint32_t ns_level[] = {2,2,2,2,2, 2};
-	uint32_t ns_feature[] = { 1,2,4,8,16,32 };
+	uint32_t ns_level[] = {		2, 3, 4, 5, 6, 7,	2, 3, 4, 5, 6, 7,	2, 3, 4, 5, 6, 7,	2, 3, 4, 5, 6, 7,	2, 3, 4, 5, 6, 7 };
+	uint32_t ns_feature[] = {	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2 };
+	uint32_t max_fs_level[] = { 14,14,14,14,14,14,	15,15,15,15,15,15,	16,16,16,16,16,16,	17,17,17,17,17,17,	18,18,18,18,18,18 };
 
 	std::ofstream outCsv;
 	outCsv.open("evalutation.csv");
-	outCsv << "n_levels, n_features, n_floats, loss\n";
+	outCsv << "n_levels, n_features, max_fs_level, n_floats, loss\n";
 
 	for (size_t i = 0; i < n_test_cases; i++) {
+
+		printf("============================\n");
+		printf("    TEST CASE %i / %i\n", i+1 , n_test_cases);
+		printf("============================\n");
+
 		json config = {
 		{"loss", {
 			{"otype", "RelativeL2"}
@@ -667,6 +673,7 @@ int main(int argc, char* argv[]) {
 			{"otype", "Vertex"},
 			{"n_features", ns_feature[i]},
 			{"n_levels", ns_level[i]},
+			{"max_features_level", 1u << max_fs_level[i]},
 			{"output_construction", "lin_interp"},
 		}},
 		{"network", {
@@ -681,7 +688,7 @@ int main(int argc, char* argv[]) {
 
 		EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf, texture, sampleWidth, sampleHeight, &test_batch);
 
-		outCsv << fmt::format("{},{},{},{}\n", ns_level[i], ns_feature[i], res.n_floats, res.MSE);
+		outCsv << fmt::format("{},{},{},{},{}\n", ns_level[i], ns_feature[i], max_fs_level[i], res.n_floats, res.MSE);
 	}
 
 	outCsv.close();

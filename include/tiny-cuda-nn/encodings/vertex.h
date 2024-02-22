@@ -281,13 +281,13 @@ template <typename T>
 class VertexEncoding : public Encoding<T> {
 public:
 	// TODO: remove n_faces parameter
-	VertexEncoding(uint32_t n_features, uint32_t n_levels, uint32_t n_dims_to_encode, uint32_t n_vertices, uint32_t n_faces, OutputConstruction output_construction, std::vector<tinyobj::index_t> indices, std::vector<float> vertices)
-		: m_n_features{ n_features }, m_n_levels{ n_levels }, m_n_dims_to_encode { n_dims_to_encode}, m_n_vertices{ n_vertices }, m_n_faces{ n_faces }, m_output_construction{ output_construction }
+	VertexEncoding(uint32_t n_features, uint32_t n_levels, uint32_t n_dims_to_encode, uint32_t n_vertices, uint32_t n_faces, OutputConstruction output_construction, uint32_t max_features_per_level, std::vector<tinyobj::index_t> indices, std::vector<float> vertices)
+		: m_n_features{ n_features }, m_n_levels{ n_levels }, m_n_dims_to_encode{ n_dims_to_encode }, m_n_vertices{ n_vertices }, m_n_faces{ n_faces }, m_output_construction{ output_construction }, m_max_features_per_level{ max_features_per_level }
 	{
-		printf("Vertex Encoding with %i feature vector entries and %i feature hierarchy levels.\n", m_n_features, m_n_levels);
+		printf("Vertex Encoding: n_features = %i, n_levels = %i, max_fs_per_level = 2^%i\n", m_n_features, m_n_levels, (int)std::log2(m_max_features_per_level));
 
 		// TODO: implement hashing
-		m_max_features_per_level = 16 * n_vertices;
+		// m_max_features_per_level = 16 * n_vertices;
 
 		switch (m_output_construction) {
 		case lin_interp:
@@ -453,7 +453,7 @@ private:
 	uint32_t m_n_params;							// Total number of feature vectors
 	uint32_t m_n_features;							// Number of entries per feature vector
 	uint32_t m_n_levels;							// Number of feature hierarchy levels
-	uint32_t m_max_features_per_level;				// Max number of unique feature vectors per level
+	uint32_t m_max_features_per_level;	// Max number of unique feature vectors per level
 
 	uint32_t m_n_vertices;							
 	uint32_t m_n_faces;
@@ -501,11 +501,14 @@ private:
 		}
 
 		std::vector<uint32_t> offset_host(m_n_faces * face_stride);	// Offset buffer
+		std::vector<uint32_t> offset_hashed(m_n_faces * face_stride);
 		std::vector<uint32_t> meta_host(1 + m_n_levels * 2);		// Metadata buffer
 		meta_host[0] = face_stride;
 
 		uint32_t level_offset = 0;
 		uint32_t unique_feature = 0;	// Index of next unique feature vector
+
+		std::vector<uint32_t> n_unique_features_level(m_n_levels);
 
 
 		for (size_t l = 0; l < m_n_levels; l++) { // Iterate over subdivision levels, l=0: no subdivision
@@ -513,6 +516,8 @@ private:
 			uint32_t n_subdiv = level_subdiv(l);
 			meta_host[1 + 2 * l] = level_offset;
 			meta_host[1 + 2 * l + 1] = n_subdiv;
+
+			uint32_t level_first_feature = unique_feature;
 
 
 			uint32_t n_features_level = (n_subdiv + 2) * (n_subdiv + 3) / 2; // #feature vectors per face on level l
@@ -585,14 +590,52 @@ private:
 			// Fix memory alignment
 			uint32_t alignment = 1u << 3;	// not 100% sure what the memory alignment requirements are but this seems to work
 			unique_feature += (alignment - (unique_feature % alignment)) % alignment;
+			n_unique_features_level[l] = unique_feature - level_first_feature;
 		}
 
-		*offset = GPUMemory<uint32_t>(offset_host.size());
-		offset->copy_from_host(offset_host);
+		// Hash offsets
+		level_offset = 0;
+		uint32_t hashed_unique_feature = 0;
+
+		for (size_t l = 0; l < m_n_levels; l++) { // Iterate over subdivision levels, l=0: no subdivision
+
+			uint32_t n_subdiv = level_subdiv(l);
+
+			uint32_t n_features_level = (n_subdiv + 2) * (n_subdiv + 3) / 2; // #feature vectors per face on level l
+
+			if (n_unique_features_level[l] <= m_max_features_per_level) {
+				for (size_t j = 0; j < m_n_faces; j++) { // At each level: Iterate over faces
+					for (size_t f = 0; f < n_features_level; f++) { // For each face, at each subdivision level: iterate over all features within it
+						offset_hashed[j * face_stride + level_offset + f] = offset_host[j * face_stride + level_offset + f];
+					}
+				}
+				hashed_unique_feature += n_unique_features_level[l];
+			}
+			else {
+				for (size_t j = 0; j < m_n_faces; j++) { // At each level: Iterate over faces
+					for (size_t f = 0; f < n_features_level; f++) { // For each face, at each subdivision level: iterate over all features within it
+						offset_hashed[j * face_stride + level_offset + f] =
+							hashOffset(offset_host[j * face_stride + level_offset + f]) + hashed_unique_feature;
+					}
+				}
+				hashed_unique_feature += m_max_features_per_level;
+			}
+
+			level_offset += n_features_level;
+		}
+
+		*offset = GPUMemory<uint32_t>(offset_hashed.size());
+		offset->copy_from_host(offset_hashed);
 		*meta = GPUMemory<uint32_t>(meta_host.size());
 		meta->copy_from_host(meta_host);
 
-		return unique_feature; // return #unique features
+		printf("n_unique_features = %i\n", hashed_unique_feature * m_n_features);
+		return hashed_unique_feature; // return #unique features
+		
+	}
+
+	uint32_t hashOffset(uint32_t offset) {
+		return offset % m_max_features_per_level;
 	}
 };
 
@@ -608,7 +651,7 @@ VertexEncoding<T>* create_vertex_encoding(uint32_t n_dims_to_encode, uint32_t n_
 	else
 		output_construction = lin_interp;
 
-	return new VertexEncoding<T>(encoding.value("n_features", 2u), encoding.value("n_levels", 1u), n_dims_to_encode, n_vertices, n_faces, output_construction, indices, vertices);
+	return new VertexEncoding<T>(encoding.value("n_features", 2u), encoding.value("n_levels", 1u), n_dims_to_encode, n_vertices, n_faces, output_construction, encoding.value("max_features_level", 1u << 14), indices, vertices);
 }
 
 }
