@@ -307,7 +307,6 @@ public:
 		m_vertices.copy_from_host(vertices);
 
 		m_n_params = computeFeatureOffset(indices, &m_offset, &m_metadata) * n_features;
-		printf("Using %i unique feature entries.\n", m_n_params);
 	}
 
 	std::unique_ptr<Context> forward_impl(

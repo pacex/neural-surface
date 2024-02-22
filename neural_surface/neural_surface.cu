@@ -256,326 +256,26 @@ std::vector<std::string> splitString(std::string input, char delimiter) {
 	return result;
 }
 
-int main(int argc, char* argv[]) {
+struct EvalResult {
+	float MSE;
+	uint32_t n_floats;
+};
+
+EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, std::vector<tinyobj::index_t> indices_host,
+	GPUMemory<float>* vertices, std::vector<float> vertices_host, GPUMemory<float>* texcoords, GPUMemory<float>* cdf,
+	cudaTextureObject_t texture,
+	int sampleWidth, int sampleHeight, GPUMemory<float>* test_batch) {
 	try {
-		uint32_t compute_capability = cuda_compute_capability();
-		if (compute_capability < MIN_GPU_ARCH) {
-			std::cerr
-				<< "Warning: Insufficient compute capability " << compute_capability << " detected. "
-				<< "This program was compiled for >=" << MIN_GPU_ARCH << " and may thus behave unexpectedly." << std::endl;
-		}
 
-		if (argc < 2) {
-			std::cout << "USAGE: " << argv[0] << " " << "path-to-image.jpg [path-to-optional-config.json]" << std::endl;
-			std::cout << "Sample EXR files are provided in 'data/images'." << std::endl;
-			return 0;
-		}
-
-		json config = {
-			{"loss", {
-				{"otype", "RelativeL2"}
-			}},
-			{"optimizer", {
-				{"otype", "Adam"},
-				// {"otype", "Shampoo"},
-				{"learning_rate", 1e-2},
-				{"beta1", 0.9f},
-				{"beta2", 0.99f},
-				{"l2_reg", 0.0f},
-				// The following parameters are only used when the optimizer is "Shampoo".
-				{"beta3", 0.9f},
-				{"beta_shampoo", 0.0f},
-				{"identity", 0.0001f},
-				{"cg_on_momentum", false},
-				{"frobenius_normalization", true},
-			}},
-			{"encoding", {
-				{"otype", "Identity"},
-				{"type", "Hash"},
-				{"n_levels", 16},
-				{"n_features_per_level", 2},
-				{"log2_hashmap_size", 19},
-				{"base_resolution", 8},
-				{"per_level_scale", 2},
-				{"interpolation", "Linear"},
-			}},
-			{"network", {
-				{"otype", "FullyFusedMLP"},
-				// {"otype", "CutlassMLP"},
-				{"n_neurons", 64},
-				{"n_hidden_layers", 4},
-				{"activation", "ReLU"},
-				{"output_activation", "None"},
-			}},
-		};
-
-		json config_vertex = {
-			{"loss", {
-				{"otype", "RelativeL2"}
-			}},
-			{"optimizer", {
-				{"otype", "Adam"},
-				// {"otype", "Shampoo"},
-				{"learning_rate", 1e-2},
-				{"beta1", 0.9f},
-				{"beta2", 0.99f},
-				{"l2_reg", 0.0f},
-				// The following parameters are only used when the optimizer is "Shampoo".
-				{"beta3", 0.9f},
-				{"beta_shampoo", 0.0f},
-				{"identity", 0.0001f},
-				{"cg_on_momentum", false},
-				{"frobenius_normalization", true},
-			}},
-			{"encoding", {
-				{"otype", "Vertex"},
-				{"n_features", 1},
-				{"n_levels", 7},
-				{"output_construction", "lin_interp"},
-			}},
-			{"network", {
-				{"otype", "FullyFusedMLP"},
-				// {"otype", "CutlassMLP"},
-				{"n_neurons", 64},
-				{"n_hidden_layers", 4},
-				{"activation", "ReLU"},
-				{"output_activation", "None"},
-			}},
-		};
-
-		if (argc >= 3) {
-			std::cout << "Loading custom json config '" << argv[2] << "'." << std::endl;
-			std::ifstream f{argv[2]};
-			config = json::parse(f, nullptr, true, /*skip_comments=*/true);
-		}
-
-		/* =========================
-		*  === LAUNCH PARAMETERS ===
-		*  =========================
-		*/
-
-		std::string object_path = "data/objects/barramundifish.obj";
-		std::string texture_path = "data/objects/BarramundiFish_baseColor.png";
-		std::string sample_path = "data/objects/sample_fish.csv";
-
-
-		/* ======================
-		*  === LOAD .OBJ FILE ===
-		*  ======================
-		*/
-
-		std::cout << "Loading " << object_path << "..." << std::flush;
-		tinyobj::attrib_t attrib;
-		std::vector<tinyobj::shape_t> shapes;
-		std::vector<tinyobj::material_t> materials;
-		std::string err;
-		std::string warn;
-		// Expect '.mtl' file in the same directory and triangulate meshes
-		bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, object_path.c_str());
-		if (!err.empty())
-		{ // `err` may contain warning message.
-			std::cerr << err << std::endl;
-		}
-		if (!warn.empty())
-		{
-			std::cerr << warn << std::endl;
-		}
-		if (!ret)
-		{
-			std::cerr << "Loading .obj file failed." << std::endl;
-			exit(1);
-		}
-
-		int shapeIndex = 0;
-		int n_vertices = attrib.vertices.size() / 3;
-		int n_texcoords = attrib.texcoords.size() / 2;
-
-		int n_indices = shapes[shapeIndex].mesh.indices.size();
-		int n_faces = n_indices / 3;
-
-		// Generate histogram of face areas to sample surface points
-		std::vector<float> histogram(n_faces);
-		float area_sum = 0.f;
-		for (size_t i = 0; i < n_faces; i++) {
-			vec3 v1(attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 0].vertex_index + 0],
-				attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 0].vertex_index + 1],
-				attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 0].vertex_index + 2]);
-
-			vec3 v2(attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 1].vertex_index + 0],
-				attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 1].vertex_index + 1],
-				attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 1].vertex_index + 2]);
-
-			vec3 v3(attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 2].vertex_index + 0],
-				attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 2].vertex_index + 1],
-				attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 2].vertex_index + 2]);
-
-			float area = 0.5f * length(cross(v2 - v1, v3 - v1));
-			histogram[i] = area;
-			area_sum += area;
-		}
-
-		// Create CDF from histogram
-		std::vector<float> cdf_host(n_faces);
-		float c_prob = 0.f;
-		for (size_t i = 0; i < n_faces; i++) {
-			c_prob += histogram[i] / area_sum;
-			cdf_host[i] = c_prob;
-		}
-
-		// write vertices, indices and cdf to GPU memory
-		GPUMemory<float> vertices(n_vertices * 3);
-		vertices.copy_from_host(attrib.vertices);
-		GPUMemory<float> texcoords(n_texcoords * 2);
-		texcoords.copy_from_host(attrib.texcoords);
-		GPUMemory<float> cdf(n_faces);
-		cdf.copy_from_host(cdf_host);
-
-		GPUMemory<tinyobj::index_t> indices(n_indices);
-		std::vector<tinyobj::index_t> ind_vec = shapes[shapeIndex].mesh.indices;
-		indices.copy_from_host(ind_vec);
-
-		/* ==============================
-		*  === LOAD REFERENCE TEXTURE ===
-		*  ==============================
-		*/
-
-		int width, height;
-		GPUMemory<float> image = load_image(texture_path, width, height);
-
-		// Second step: create a cuda texture out of this image. It'll be used to generate training data efficiently on the fly
-		cudaResourceDesc resDesc;
-		memset(&resDesc, 0, sizeof(resDesc));
-		resDesc.resType = cudaResourceTypePitch2D;
-		resDesc.res.pitch2D.devPtr = image.data();
-		resDesc.res.pitch2D.desc = cudaCreateChannelDesc(32, 32, 32, 32, cudaChannelFormatKindFloat);
-		resDesc.res.pitch2D.width = width;
-		resDesc.res.pitch2D.height = height;
-		resDesc.res.pitch2D.pitchInBytes = width * 4 * sizeof(float);
-
-		cudaTextureDesc texDesc;
-		memset(&texDesc, 0, sizeof(texDesc));
-		texDesc.filterMode = cudaFilterModeLinear;
-		texDesc.normalizedCoords = true;
-		texDesc.addressMode[0] = cudaAddressModeClamp;
-		texDesc.addressMode[1] = cudaAddressModeClamp;
-		texDesc.addressMode[2] = cudaAddressModeClamp;
-
-		cudaTextureObject_t texture;
-		CUDA_CHECK_THROW(cudaCreateTextureObject(&texture, &resDesc, &texDesc, nullptr));
-
-		/* =======================
-		*  === LOAD TEST INPUT ===
-		*  =======================
-		*/
-
-		const bool testInput = true;
-
-		// Vector to store the floats
-		
-		int sampleWidth, sampleHeight;
-		sampleWidth = 0;
-		sampleHeight = 0;
-		std::vector<float> surface_positions;
-
-		if (testInput) {
-
-			std::ifstream file(sample_path);
-
-			if (!file.is_open()) {
-				std::cerr << "Error opening file: " << sample_path << std::endl;
-				return 1;
-			}		
-
-			// Read width and height
-			std::string firstLine;	
-
-			if (std::getline(file, firstLine)) {
-				std::vector<std::string> w_and_h = splitString(firstLine, ',');
-				sampleWidth = std::stoi(w_and_h[0]);
-				sampleHeight = std::stoi(w_and_h[1]);
-			}
-			else {
-				std::cerr << "Error reading sample.csv" << std::endl;
-				return 1;
-			}
-
-			// Continue reading the remaining lines
-			std::string line;
-			while (std::getline(file, line)) {
-				std::vector<std::string> s_pos = splitString(line, ',');
-				uint32_t faceId = static_cast<uint32_t>(std::stoul(s_pos[0]));
-				surface_positions.push_back(*((float*) &faceId));
-				surface_positions.push_back(std::stof(s_pos[1]));
-				surface_positions.push_back(std::stof(s_pos[2]));
-
-			}
-
-			// Close the file
-			file.close();
-		}
-
-		// Write surface_positions to GPU memory
-		GPUMemory<float> test_batch(sampleWidth * sampleHeight * 3);
-		test_batch.copy_from_host(surface_positions.data());
-
-		if (testInput) {
-			
-			cudaStream_t test_generator_stream;
-			CUDA_CHECK_THROW(cudaStreamCreate(&test_generator_stream));
-			GPUMatrix<float> test_generator_batch(test_batch.data(), 3, sampleWidth * sampleHeight);
-			GPUMatrix<float> test_generator_result(3, sampleWidth * sampleHeight);
-			linear_kernel(generate_training_target, 0, test_generator_stream, sampleWidth * sampleHeight, n_faces, texture, test_generator_batch.data(), indices.data(), texcoords.data(), test_generator_result.data());
-
-			auto filename = "data_generator_test.jpg";
-			std::cout << "Writing '" << filename << "'... ";
-			save_image(test_generator_result.data(), sampleWidth, sampleHeight, 3, 3, filename);
-			std::cout << "done." << std::endl;
-			
-		}
-
-
-
-		// Third step: sample a reference image to dump to disk. Visual comparison of this reference image and the learned
-		//             function will be eventually possible.
-
-		//int sampling_width = width;
-		//int sampling_height = height;
-
-		// Uncomment to fix the resolution of the training task independent of input image
-		// int sampling_width = 1024;
-		// int sampling_height = 1024;
-
-		//uint32_t n_coords = sampling_width * sampling_height;
-		//uint32_t n_coords_padded = next_multiple(n_coords, BATCH_SIZE_GRANULARITY);
-
-		//GPUMemory<float> sampled_image(n_coords * 3);
-		//GPUMemory<float> xs_and_ys(n_coords_padded * 2);
-
-		/*
-		std::vector<float> host_xs_and_ys(n_coords * 2);
-		for (int y = 0; y < sampling_height; ++y) {
-			for (int x = 0; x < sampling_width; ++x) {
-				int idx = (y * sampling_width + x) * 2;
-				host_xs_and_ys[idx+0] = (float)(x + 0.5) / (float)sampling_width;
-				host_xs_and_ys[idx+1] = (float)(y + 0.5) / (float)sampling_height;
-			}
-		}
-
-		xs_and_ys.copy_from_host(host_xs_and_ys.data());
-
-		linear_kernel(eval_image<3>, 0, nullptr, n_coords, texture, xs_and_ys.data(), sampled_image.data());
-
-		save_image(sampled_image.data(), sampling_width, sampling_height, 3, 3, "reference.jpg");
-		*/
+		EvalResult res;
 
 		/* =======================
 		*  === TRAIN THE MODEL ===
 		*  =======================
 		*/
 
-		// Various constants for the network and optimization
+			// Various constants for the network and optimization
 		const uint32_t batch_size = 1 << 18;
-		//const uint32_t n_training_steps = argc >= 4 ? atoi(argv[3]) : 10000000;
 		const uint32_t n_input_dims = N_INPUT_DIMS; // (v1, v2, v3, alpha, beta, gamma)
 		const uint32_t n_output_dims = N_OUTPUT_DIMS; // RGB color
 
@@ -585,7 +285,7 @@ int main(int argc, char* argv[]) {
 		CUDA_CHECK_THROW(cudaStreamCreate(&inference_stream));
 		cudaStream_t training_stream = inference_stream;
 
-		default_rng_t rng{1337};
+		default_rng_t rng{ 1337 };
 		// Auxiliary matrices for training
 
 		GPUMatrix<float> training_batch_raw(n_input_dims, batch_size);
@@ -593,15 +293,18 @@ int main(int argc, char* argv[]) {
 		GPUMatrix<float> training_target(n_output_dims, batch_size);
 
 		json encoding_opts = config.value("encoding", json::object());
-		json encoding_opts_vertex = config_vertex.value("encoding", json::object());
 		json loss_opts = config.value("loss", json::object());
 		json optimizer_opts = config.value("optimizer", json::object());
 		json network_opts = config.value("network", json::object());
 
+		uint32_t n_vertices = vertices_host.size() / 3;
+		uint32_t n_faces = indices_host.size() / 3;
+
 		std::shared_ptr<Loss<precision_t>> loss{ create_loss<precision_t>(loss_opts) };
 		std::shared_ptr<Optimizer<precision_t>> optimizer{ create_optimizer<precision_t>(optimizer_opts) };
-		std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(std::shared_ptr<Encoding<precision_t>>{create_vertex_encoding<precision_t>(n_input_dims, n_vertices, n_faces, ind_vec, attrib.vertices, encoding_opts_vertex)}, n_output_dims, network_opts);
-		// std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(std::shared_ptr<Encoding<precision_t>>{create_encoding<precision_t>(n_input_dims, encoding_opts)}, n_output_dims, network_opts);
+		std::shared_ptr<Encoding<precision_t>> encoding{ create_vertex_encoding<precision_t>(n_input_dims, n_vertices, n_faces, indices_host, vertices_host, encoding_opts) };
+		std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(encoding, n_output_dims, network_opts);
+		//std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(std::shared_ptr<Encoding<precision_t>>{create_encoding<precision_t>(n_input_dims, encoding_opts)}, n_output_dims, network_opts);
 
 		auto model = std::make_shared<Trainer<float, precision_t, precision_t>>(network, optimizer, loss);
 
@@ -616,7 +319,8 @@ int main(int argc, char* argv[]) {
 
 		for (uint32_t i = 0; i < n_training_steps; ++i) {
 			bool print_loss = i % interval == 0;
-			bool visualize_learned_func = argc < 5 && i % interval == 0;
+			bool visualize_learned_func = (i % interval == 0) || (i == (n_training_steps - 1));
+			bool writeEvalResult = i == (n_training_steps - 1);
 
 			/* ===============================
 			*  === GENERATE TRAINING BATCH ===
@@ -629,11 +333,11 @@ int main(int argc, char* argv[]) {
 				linear_kernel(setup_kernel, 0, training_stream, batch_size, crs, i);
 
 				// Generate Surface Points - training input
-				linear_kernel(generate_face_positions<precision_t>, 0, training_stream, batch_size, n_faces, crs, indices.data(), vertices.data(), cdf.data(), training_batch_raw.data());
+				linear_kernel(generate_face_positions<precision_t>, 0, training_stream, batch_size, n_faces, crs, indices->data(), vertices->data(), cdf->data(), training_batch_raw.data());
 				//linear_kernel(rescale_faceIds, 0, training_stream, batch_size, n_faces, training_batch_raw.data(), training_batch.data());
 
 				// Sample reference texture at surface points - training output
-				linear_kernel(generate_training_target, 0, training_stream, batch_size, n_faces, texture, training_batch_raw.data(), indices.data(), texcoords.data(), training_target.data());
+				linear_kernel(generate_training_target, 0, training_stream, batch_size, n_faces, texture, training_batch_raw.data(), indices->data(), texcoords->data(), training_target.data());
 
 				cudaFree(crs);
 
@@ -663,30 +367,37 @@ int main(int argc, char* argv[]) {
 
 			// Debug outputs
 			{
-				
+
+				if (writeEvalResult) {
+					res.MSE = tmp_loss / (float)tmp_loss_counter;
+					res.n_floats = encoding.get()->n_params();
+				}
+
 				if (print_loss) {
 					std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
-					std::cout << "Step#" << i << ": " << "loss=" << tmp_loss/(float)tmp_loss_counter << " time=" << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
+					std::cout << "Step#" << i << ": " << "loss=" << tmp_loss / (float)tmp_loss_counter << " time=" << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
 
 					tmp_loss = 0;
 					tmp_loss_counter = 0;
 				}
 
-				if (visualize_learned_func && testInput) {
+				if (visualize_learned_func) {
 
 					// Auxiliary matrices for evaluation
 					GPUMatrix<float> prediction(n_output_dims, sampleWidth * sampleHeight);
-					GPUMatrix<float> inference_batch_raw(test_batch.data(), n_input_dims, sampleWidth * sampleHeight);
+					GPUMatrix<float> inference_batch_raw(test_batch->data(), n_input_dims, sampleWidth * sampleHeight);
 					GPUMatrix<float> inference_batch(n_input_dims, sampleWidth * sampleHeight);
 					linear_kernel(rescale_faceIds, 0, inference_stream, sampleWidth * sampleHeight, n_faces, inference_batch_raw.data(), inference_batch.data());
 
 					network->inference(inference_stream, inference_batch_raw, prediction);
 					std::vector<float> debug = prediction.to_cpu_vector();
-					auto filename = fmt::format("{}.jpg", i);
+					auto filename = fmt::format("images/nl{}_nf{}_iter{}.jpg", encoding_opts.value("n_levels", 1u), encoding_opts.value("n_features", 2u), i);
 					std::cout << "Writing '" << filename << "'... ";
 					save_image(prediction.data(), sampleWidth, sampleHeight, 3, 3, filename);
 					std::cout << "done." << std::endl;
 				}
+
+				
 
 				// Don't count visualizing as part of timing
 				// (assumes visualize_learned_pdf is only true when print_loss is true)
@@ -700,19 +411,280 @@ int main(int argc, char* argv[]) {
 			}
 		}
 
-		// Dump final image if a name was specified
-		if (argc >= 5) {
-			//network->inference(inference_stream, inference_batch, prediction);
-			//save_image(prediction.data(), sampling_width, sampling_height, 3, n_output_dims, argv[4]);
-		}
-
 		free_all_gpu_memory_arenas();
 
-		// If only the memory arenas pertaining to a single stream are to be freed, use
-		//free_gpu_memory_arena(stream);
-	} catch (const std::exception& e) {
+		return res;
+	}
+	catch (const std::exception& e) {
 		std::cout << "Uncaught exception: " << e.what() << std::endl;
 	}
+
+}
+
+int main(int argc, char* argv[]) {
+	
+	uint32_t compute_capability = cuda_compute_capability();
+	if (compute_capability < MIN_GPU_ARCH) {
+		std::cerr
+			<< "Warning: Insufficient compute capability " << compute_capability << " detected. "
+			<< "This program was compiled for >=" << MIN_GPU_ARCH << " and may thus behave unexpectedly." << std::endl;
+	}
+
+	/*
+	if (argc < 2) {
+		std::cout << "USAGE: " << argv[0] << " " << "path-to-image.jpg [path-to-optional-config.json]" << std::endl;
+		std::cout << "Sample EXR files are provided in 'data/images'." << std::endl;
+		return 0;
+	}*/
+
+	/*
+	if (argc >= 3) {
+		std::cout << "Loading custom json config '" << argv[2] << "'." << std::endl;
+		std::ifstream f{argv[2]};
+		config = json::parse(f, nullptr, true, /*skip_comments=*//*true);
+	}*/
+
+	/* =========================
+	*  === LAUNCH PARAMETERS ===
+	*  =========================
+	*/
+
+	std::string object_path = "data/objects/barramundifish.obj";
+	std::string texture_path = "data/objects/BarramundiFish_baseColor.png";
+	std::string sample_path = "data/objects/sample_fish.csv";
+
+
+	/* ======================
+	*  === LOAD .OBJ FILE ===
+	*  ======================
+	*/
+
+	std::cout << "Loading " << object_path << "..." << std::flush;
+	tinyobj::attrib_t attrib;
+	std::vector<tinyobj::shape_t> shapes;
+	std::vector<tinyobj::material_t> materials;
+	std::string err;
+	std::string warn;
+	// Expect '.mtl' file in the same directory and triangulate meshes
+	bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, object_path.c_str());
+	if (!err.empty())
+	{ // `err` may contain warning message.
+		std::cerr << err << std::endl;
+	}
+	if (!warn.empty())
+	{
+		std::cerr << warn << std::endl;
+	}
+	if (!ret)
+	{
+		std::cerr << "Loading .obj file failed." << std::endl;
+		exit(1);
+	}
+
+	int shapeIndex = 0;
+	int n_vertices = attrib.vertices.size() / 3;
+	int n_texcoords = attrib.texcoords.size() / 2;
+
+	int n_indices = shapes[shapeIndex].mesh.indices.size();
+	int n_faces = n_indices / 3;
+
+	// Generate histogram of face areas to sample surface points
+	std::vector<float> histogram(n_faces);
+	float area_sum = 0.f;
+	for (size_t i = 0; i < n_faces; i++) {
+		vec3 v1(attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 0].vertex_index + 0],
+			attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 0].vertex_index + 1],
+			attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 0].vertex_index + 2]);
+
+		vec3 v2(attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 1].vertex_index + 0],
+			attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 1].vertex_index + 1],
+			attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 1].vertex_index + 2]);
+
+		vec3 v3(attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 2].vertex_index + 0],
+			attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 2].vertex_index + 1],
+			attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 2].vertex_index + 2]);
+
+		float area = 0.5f * length(cross(v2 - v1, v3 - v1));
+		histogram[i] = area;
+		area_sum += area;
+	}
+
+	// Create CDF from histogram
+	std::vector<float> cdf_host(n_faces);
+	float c_prob = 0.f;
+	for (size_t i = 0; i < n_faces; i++) {
+		c_prob += histogram[i] / area_sum;
+		cdf_host[i] = c_prob;
+	}
+
+	// write vertices, indices and cdf to GPU memory
+	GPUMemory<float> vertices(n_vertices * 3);
+	vertices.copy_from_host(attrib.vertices);
+	GPUMemory<float> texcoords(n_texcoords * 2);
+	texcoords.copy_from_host(attrib.texcoords);
+	GPUMemory<float> cdf(n_faces);
+	cdf.copy_from_host(cdf_host);
+
+	GPUMemory<tinyobj::index_t> indices(n_indices);
+	std::vector<tinyobj::index_t> indices_host = shapes[shapeIndex].mesh.indices;
+	indices.copy_from_host(indices_host);
+
+	/* ==============================
+	*  === LOAD REFERENCE TEXTURE ===
+	*  ==============================
+	*/
+
+	int width, height;
+	GPUMemory<float> image = load_image(texture_path, width, height);
+
+	// Second step: create a cuda texture out of this image. It'll be used to generate training data efficiently on the fly
+	cudaResourceDesc resDesc;
+	memset(&resDesc, 0, sizeof(resDesc));
+	resDesc.resType = cudaResourceTypePitch2D;
+	resDesc.res.pitch2D.devPtr = image.data();
+	resDesc.res.pitch2D.desc = cudaCreateChannelDesc(32, 32, 32, 32, cudaChannelFormatKindFloat);
+	resDesc.res.pitch2D.width = width;
+	resDesc.res.pitch2D.height = height;
+	resDesc.res.pitch2D.pitchInBytes = width * 4 * sizeof(float);
+
+	cudaTextureDesc texDesc;
+	memset(&texDesc, 0, sizeof(texDesc));
+	texDesc.filterMode = cudaFilterModeLinear;
+	texDesc.normalizedCoords = true;
+	texDesc.addressMode[0] = cudaAddressModeClamp;
+	texDesc.addressMode[1] = cudaAddressModeClamp;
+	texDesc.addressMode[2] = cudaAddressModeClamp;
+
+	cudaTextureObject_t texture;
+	CUDA_CHECK_THROW(cudaCreateTextureObject(&texture, &resDesc, &texDesc, nullptr));
+
+	/* =======================
+	*  === LOAD TEST INPUT ===
+	*  =======================
+	*/
+	const bool testInput = true;
+
+	// Vector to store the floats
+		
+	int sampleWidth, sampleHeight;
+	sampleWidth = 0;
+	sampleHeight = 0;
+	std::vector<float> surface_positions;
+
+	if (testInput) {
+
+		std::ifstream file(sample_path);
+
+		if (!file.is_open()) {
+			std::cerr << "Error opening file: " << sample_path << std::endl;
+			return 1;
+		}		
+
+		// Read width and height
+		std::string firstLine;	
+
+		if (std::getline(file, firstLine)) {
+			std::vector<std::string> w_and_h = splitString(firstLine, ',');
+			sampleWidth = std::stoi(w_and_h[0]);
+			sampleHeight = std::stoi(w_and_h[1]);
+		}
+		else {
+			std::cerr << "Error reading sample.csv" << std::endl;
+			return 1;
+		}
+
+		// Continue reading the remaining lines
+		std::string line;
+		while (std::getline(file, line)) {
+			std::vector<std::string> s_pos = splitString(line, ',');
+			uint32_t faceId = static_cast<uint32_t>(std::stoul(s_pos[0]));
+			surface_positions.push_back(*((float*) &faceId));
+			surface_positions.push_back(std::stof(s_pos[1]));
+			surface_positions.push_back(std::stof(s_pos[2]));
+
+		}
+
+		// Close the file
+		file.close();
+	}
+
+	// Write surface_positions to GPU memory
+	GPUMemory<float> test_batch(sampleWidth * sampleHeight * 3);
+	test_batch.copy_from_host(surface_positions.data());
+
+	if (testInput) {
+			
+		cudaStream_t test_generator_stream;
+		CUDA_CHECK_THROW(cudaStreamCreate(&test_generator_stream));
+		GPUMatrix<float> test_generator_batch(test_batch.data(), 3, sampleWidth * sampleHeight);
+		GPUMatrix<float> test_generator_result(3, sampleWidth * sampleHeight);
+		linear_kernel(generate_training_target, 0, test_generator_stream, sampleWidth * sampleHeight, n_faces, texture, test_generator_batch.data(), indices.data(), texcoords.data(), test_generator_result.data());
+
+		auto filename = "images/data_generator_test.jpg";
+		std::cout << "Writing '" << filename << "'... ";
+		save_image(test_generator_result.data(), sampleWidth, sampleHeight, 3, 3, filename);
+		std::cout << "done." << std::endl;
+			
+	}
+
+
+	/* =========================
+		TRAINING END EVALUATION
+	   =========================
+	*/
+
+	uint32_t n_test_cases = 6;
+	//uint32_t ns_level[] = {   1,1,1,1,1, 1,		2,2,2,2,2, 2,	3,3,3,3,3, 3,	4,4,4,4,4, 4,	5,5,5,5,	6,6,6,	7,7 };
+	//uint32_t ns_feature[] = { 1,2,4,8,16,32,	1,2,4,8,16,32,	1,2,4,8,16,32,	1,2,4,8,16,32,	1,2,4,8,	1,2,4,	1,2 };
+
+	uint32_t ns_level[] = {2,2,2,2,2, 2};
+	uint32_t ns_feature[] = { 1,2,4,8,16,32 };
+
+	std::ofstream outCsv;
+	outCsv.open("evalutation.csv");
+	outCsv << "n_levels, n_features, n_floats, loss\n";
+
+	for (size_t i = 0; i < n_test_cases; i++) {
+		json config = {
+		{"loss", {
+			{"otype", "RelativeL2"}
+		}},
+		{"optimizer", {
+			{"otype", "Adam"},
+			// {"otype", "Shampoo"},
+			{"learning_rate", 1e-2},
+			{"beta1", 0.9f},
+			{"beta2", 0.99f},
+			{"l2_reg", 0.0f},
+			// The following parameters are only used when the optimizer is "Shampoo".
+			{"beta3", 0.9f},
+			{"beta_shampoo", 0.0f},
+			{"identity", 0.0001f},
+			{"cg_on_momentum", false},
+			{"frobenius_normalization", true},
+		}},
+		{"encoding", {
+			{"otype", "Vertex"},
+			{"n_features", ns_feature[i]},
+			{"n_levels", ns_level[i]},
+			{"output_construction", "lin_interp"},
+		}},
+		{"network", {
+			{"otype", "FullyFusedMLP"},
+			// {"otype", "CutlassMLP"},
+			{"n_neurons", 64},
+			{"n_hidden_layers", 4},
+			{"activation", "ReLU"},
+			{"output_activation", "None"},
+		}},
+		};
+
+		EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf, texture, sampleWidth, sampleHeight, &test_batch);
+
+		outCsv << fmt::format("{},{},{},{}\n", ns_level[i], ns_feature[i], res.n_floats, res.MSE);
+	}
+
+	outCsv.close();
 
 	return EXIT_SUCCESS;
 }
