@@ -389,7 +389,13 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 					GPUMatrix<float> inference_batch(n_input_dims, sampleWidth * sampleHeight);
 					linear_kernel(rescale_faceIds, 0, inference_stream, sampleWidth * sampleHeight, n_faces, inference_batch_raw.data(), inference_batch.data());
 
+					cudaThreadSynchronize();
+					std::chrono::steady_clock::time_point evalStart = std::chrono::steady_clock::now();
 					network->inference(inference_stream, inference_batch_raw, prediction);
+					cudaThreadSynchronize();
+					std::chrono::steady_clock::time_point evalEnd = std::chrono::steady_clock::now();
+					std::cout << "Evaluation time = " << std::chrono::duration_cast<std::chrono::microseconds>(evalEnd - evalStart).count() << "[microseconds]" << std::endl;
+
 					std::vector<float> debug = prediction.to_cpu_vector();
 					auto filename = fmt::format("images/nl{}_nmf{}_iter{}.jpg", encoding_opts.value("n_levels", 1u), std::log2(encoding_opts.value("max_features_level", 1u << 14)), i);
 					std::cout << "Writing '" << filename << "'... ";
