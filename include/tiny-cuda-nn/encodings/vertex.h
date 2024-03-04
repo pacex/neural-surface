@@ -486,8 +486,6 @@ private:
 		* returns number of unique feature vectors
 		*/
 
-		// TODO: hashing
-
 		// TODO: make this hyperparam
 		auto level_subdiv = [](uint32_t l) {
 			return std::pow(2, l) - 1;
@@ -635,6 +633,9 @@ private:
 	}
 
 	uint32_t hashOffset(uint32_t offset) {
+
+		//const uint32_t big_prime = 2654435761u;
+		//return (offset * big_prime) % m_max_features_per_level;
 		return offset % m_max_features_per_level;
 	}
 };

@@ -264,7 +264,7 @@ struct EvalResult {
 EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, std::vector<tinyobj::index_t> indices_host,
 	GPUMemory<float>* vertices, std::vector<float> vertices_host, GPUMemory<float>* texcoords, GPUMemory<float>* cdf,
 	cudaTextureObject_t texture,
-	int sampleWidth, int sampleHeight, GPUMemory<float>* test_batch) {
+	int sampleWidth, int sampleHeight, GPUMemory<float>* test_batch, long* training_time_ms) {
 	try {
 
 		EvalResult res;
@@ -309,6 +309,8 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 		auto model = std::make_shared<Trainer<float, precision_t, precision_t>>(network, optimizer, loss);
 
 		std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+		std::chrono::steady_clock::time_point end;
+
 
 		float tmp_loss = 0;
 		uint32_t tmp_loss_counter = 0;
@@ -374,7 +376,7 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 				}
 
 				if (print_loss) {
-					std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+					end = std::chrono::steady_clock::now();
 					std::cout << "Step#" << i << ": " << "loss=" << tmp_loss / (float)tmp_loss_counter << " time=" << std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count() << "[ms]" << std::endl;
 
 					tmp_loss = 0;
@@ -408,7 +410,7 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 				// Don't count visualizing as part of timing
 				// (assumes visualize_learned_pdf is only true when print_loss is true)
 				if (print_loss) {
-					begin = std::chrono::steady_clock::now();
+					//begin = std::chrono::steady_clock::now();
 				}
 			}
 
@@ -416,6 +418,8 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 				interval *= 10;
 			}
 		}
+
+		*training_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
 
 		free_all_gpu_memory_arenas();
 
@@ -649,7 +653,7 @@ int main(int argc, char* argv[]) {
 
 	std::ofstream outCsv;
 	outCsv.open("evalutation.csv");
-	outCsv << "n_levels, n_features, max_fs_level, n_floats, loss\n";
+	outCsv << "n_levels, n_features, max_fs_level, n_floats, loss, training_time_ms\n";
 
 	for (size_t i = 0; i < n_test_cases; i++) {
 
@@ -692,9 +696,10 @@ int main(int argc, char* argv[]) {
 		}},
 		};
 
-		EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf, texture, sampleWidth, sampleHeight, &test_batch);
+		long training_time_ms;
+		EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf, texture, sampleWidth, sampleHeight, &test_batch, &training_time_ms);
 
-		outCsv << fmt::format("{},{},{},{},{}\n", ns_level[i], ns_feature[i], max_fs_level[i], res.n_floats, res.MSE);
+		outCsv << fmt::format("{},{},{},{},{},{}\n", ns_level[i], ns_feature[i], max_fs_level[i], res.n_floats, res.MSE, training_time_ms);
 	}
 
 	outCsv.close();
