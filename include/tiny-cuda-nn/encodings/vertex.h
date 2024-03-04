@@ -47,8 +47,6 @@
 
 namespace tcnn {
 
-enum OutputConstruction { lin_interp, concat };
-
 template <typename T>
 struct FeatureRef{
 	uint32_t f0;
@@ -117,14 +115,10 @@ __global__ void vertex_encoding(
 	const uint32_t num_instances,
 	const uint32_t n_features,
 	const uint32_t n_levels,
-	const uint32_t n_frequencies,
 	const uint32_t n_faces,
-	const uint32_t n_vertices,
-	const OutputConstruction constr,
 	const uint32_t output_width,
 	const uint32_t padded_output_width,
 	tinyobj::index_t* indices,
-	float* vertices,
 	T* features,
 	uint32_t* offset,
 	uint32_t* meta,
@@ -163,41 +157,10 @@ __global__ void vertex_encoding(
 	FeatureRef<T> fRef = computeFeatureRef(faceId,
 		w0, w1, w2, level, offset, meta);
 
-	
-
-	switch (constr) {
-	case lin_interp:
-	
-		// Interpolate feature vectors
-		data_out(j, i) = fRef.w0 * features[n_features * fRef.f0 + feature_entry]
-			+ fRef.w1 * features[n_features * fRef.f1 + feature_entry]
-			+ fRef.w2 * features[n_features * fRef.f2 + feature_entry];
-
-		break;
-
-	case concat:
-		uint32_t vertex = j / n_features;
-
-		if (vertex >= 3) {
-			// Positional Component
-			const T v = fRef.w0 * (T)vertices[3 * fRef.f0 + (j % 3)] + fRef.w1 * (T)vertices[3 * fRef.f1 + (j % 3)] + fRef.w2 * (T)vertices[3 * fRef.f2 + (j % 3)];
-			const uint32_t log2_frequency = (j / 2) % n_frequencies;
-
-			const float phase_shift = (j % 2) * (PI / 2);
-
-			const float x = scalbnf(v, log2_frequency);
-			const float input = x * PI + phase_shift;
-
-			data_out(j, i) = (T)__sinf(input);
-		}
-		else {
-			// Feature Component
-			uint32_t f = indices[3 * faceId + vertex].vertex_index;
-			data_out(j, i) = features[n_features * f + (j % n_features)];
-		}
-
-		break;
-	}
+	// Interpolate feature vectors
+	data_out(j, i) = fRef.w0 * features[n_features * fRef.f0 + feature_entry]
+		+ fRef.w1 * features[n_features * fRef.f1 + feature_entry]
+		+ fRef.w2 * features[n_features * fRef.f2 + feature_entry];
 
 	return;	
 }
@@ -209,8 +172,6 @@ __global__ void vertex_encoding_backward(
 	const uint32_t n_features,
 	const uint32_t n_levels,
 	const uint32_t n_faces,
-	const uint32_t n_vertices,
-	const OutputConstruction constr,
 	tinyobj::index_t* indices,
 	T* features,
 	uint32_t* offset,
@@ -248,31 +209,10 @@ __global__ void vertex_encoding_backward(
 	FeatureRef<T> fRef = computeFeatureRef(faceId,
 		w0, w1, w2, level, offset, meta);
 
-	switch (constr) {
-
-		/*
-			LINEAR INTERPOLATION
-		*/
-	case lin_interp:
-		gradient = dL_dy(j, i);
-		atomicAdd(&features[n_features * fRef.f0 + feature_entry], -gradient * fRef.w0);
-		atomicAdd(&features[n_features * fRef.f1 + feature_entry], -gradient * fRef.w1);
-		atomicAdd(&features[n_features * fRef.f2 + feature_entry], -gradient * fRef.w2);
-		break;
-
-		/*
-			CONCATENATION
-		*/
-	case concat:
-		if (j >= n_features * 3)
-			break;
-		uint32_t vertex = j / n_features;
-		uint32_t f = indices[3 * faceId + vertex].vertex_index;
-
-		gradient = dL_dy(j, i);
-		atomicAdd(&features[n_features * f + (j % n_features)], -gradient);
-		break;
-	}
+	gradient = dL_dy(j, i);
+	atomicAdd(&features[n_features * fRef.f0 + feature_entry], -gradient * fRef.w0);
+	atomicAdd(&features[n_features * fRef.f1 + feature_entry], -gradient * fRef.w1);
+	atomicAdd(&features[n_features * fRef.f2 + feature_entry], -gradient * fRef.w2);
 
 	return;
 }
@@ -281,30 +221,17 @@ template <typename T>
 class VertexEncoding : public Encoding<T> {
 public:
 	// TODO: remove n_faces parameter
-	VertexEncoding(uint32_t n_features, uint32_t n_levels, uint32_t n_dims_to_encode, uint32_t n_vertices, uint32_t n_faces, OutputConstruction output_construction, uint32_t max_features_per_level, std::vector<tinyobj::index_t> indices, std::vector<float> vertices)
-		: m_n_features{ n_features }, m_n_levels{ n_levels }, m_n_dims_to_encode{ n_dims_to_encode }, m_n_vertices{ n_vertices }, m_n_faces{ n_faces }, m_output_construction{ output_construction }, m_max_features_per_level{ max_features_per_level }
+	VertexEncoding(uint32_t n_features, uint32_t n_levels, uint32_t n_dims_to_encode, uint32_t n_faces, uint32_t n_vertices, uint32_t max_features_per_level, std::vector<tinyobj::index_t> indices)
+		: m_n_features{ n_features }, m_n_levels{ n_levels }, m_n_dims_to_encode{ n_dims_to_encode }, m_n_faces{ n_faces }, m_n_vertices{ n_vertices }, m_max_features_per_level {
+		max_features_per_level
+	}
 	{
 		printf("Vertex Encoding: n_features = %i, n_levels = %i, max_fs_per_level = 2^%i\n", m_n_features, m_n_levels, (int)std::log2(m_max_features_per_level));
 
-		// TODO: implement hashing
-		// m_max_features_per_level = 16 * n_vertices;
-
-		switch (m_output_construction) {
-		case lin_interp:
-			m_n_output_dims = n_features * m_n_levels;
-			break;
-		case concat:
-			m_n_output_dims = 3 * n_features + m_n_frequencies;
-			break;
-		default:
-			m_n_output_dims = n_features;
-		}
-
+		m_n_output_dims = n_features * m_n_levels;
+		
 		m_indices = GPUMemory<tinyobj::index_t>(indices.size());
 		m_indices.copy_from_host(indices);
-
-		m_vertices = GPUMemory<float>(vertices.size());
-		m_vertices.copy_from_host(vertices);
 
 		m_n_params = computeFeatureOffset(indices, &m_offset, &m_metadata) * n_features;
 	}
@@ -335,14 +262,10 @@ public:
 			input.n(),
 			m_n_features,
 			m_n_levels,
-			m_n_frequencies,
 			m_n_faces,
-			m_n_vertices,
-			m_output_construction,
 			m_n_output_dims,
 			padded_output_width(),
 			m_indices.data(),
-			m_vertices.data(),
 			use_inference_params ? this->inference_params() : this->params(),
 			m_offset.data(),
 			m_metadata.data(),
@@ -381,8 +304,6 @@ public:
 			m_n_features,
 			m_n_levels,
 			m_n_faces,
-			m_n_vertices,
-			m_output_construction,
 			m_indices.data(),
 			use_inference_params ? this->inference_params() : this->params(),
 			m_offset.data(),
@@ -446,22 +367,17 @@ private:
 		GPUMatrix<float> dy_dx;
 	};
 
-	OutputConstruction m_output_construction;		// Interpolate or concatenate feature vectors
-
 	uint32_t m_n_dims_to_encode;					// FaceId, w0, w1
 	
 	uint32_t m_n_params;							// Total number of feature vectors
 	uint32_t m_n_features;							// Number of entries per feature vector
 	uint32_t m_n_levels;							// Number of feature hierarchy levels
 	uint32_t m_max_features_per_level;	// Max number of unique feature vectors per level
-
-	uint32_t m_n_vertices;							
+							
 	uint32_t m_n_faces;
-
-	uint32_t m_n_frequencies = 12;					// Number of frequencies to encode position in (only applied in concat mode)
+	uint32_t m_n_vertices;
 
 	GPUMemory<tinyobj::index_t> m_indices;
-	GPUMemory<float> m_vertices;
 	GPUMemory<uint32_t> m_offset;
 	GPUMemory<uint32_t> m_metadata;
 
@@ -642,17 +558,8 @@ private:
 
 template <typename T>
 VertexEncoding<T>* create_vertex_encoding(uint32_t n_dims_to_encode, uint32_t n_vertices, uint32_t n_faces, std::vector<tinyobj::index_t> indices, std::vector<float> vertices, const json& encoding) {
-	const std::string output_construction_str = encoding.value("output_construction", "lin_interp");
-	OutputConstruction output_construction;
 
-	if (equals_case_insensitive(output_construction_str, "lin_interp"))
-		output_construction = lin_interp;
-	else if (equals_case_insensitive(output_construction_str, "concat"))
-		output_construction = concat;
-	else
-		output_construction = lin_interp;
-
-	return new VertexEncoding<T>(encoding.value("n_features", 2u), encoding.value("n_levels", 1u), n_dims_to_encode, n_vertices, n_faces, output_construction, encoding.value("max_features_level", 1u << 14), indices, vertices);
+	return new VertexEncoding<T>(encoding.value("n_features", 2u), encoding.value("n_levels", 1u), n_dims_to_encode, n_faces, n_vertices, encoding.value("max_features_level", 1u << 14), indices);
 }
 
 }
