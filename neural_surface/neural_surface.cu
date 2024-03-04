@@ -115,8 +115,12 @@ __global__ void eval_image(uint32_t n_elements, cudaTextureObject_t texture, flo
 
 __global__ void setup_kernel(uint32_t n_elements, curandState* state, int iter) {
 
-	int idx = threadIdx.x + blockDim.x * blockIdx.x;
-	curand_init(1337 + iter, idx, 0, &state[idx]);
+	int idx = threadIdx.x + blockDim.x * blockIdx.x + blockDim.y * blockDim.x * blockIdx.y;
+
+	if (idx >= n_elements)
+		return;
+
+	curand_init(1337, idx, 23 * iter, &state[idx]);
 }
 
 template <typename T>
