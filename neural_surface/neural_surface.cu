@@ -113,14 +113,14 @@ __global__ void eval_image(uint32_t n_elements, cudaTextureObject_t texture, flo
 #define N_INPUT_DIMS 3;
 #define N_OUTPUT_DIMS 3;
 
-__global__ void setup_kernel(uint32_t n_elements, curandState* state, int iter) {
+__global__ void setup_kernel(uint32_t n_elements, curandState* state) {
 
 	int idx = threadIdx.x + blockDim.x * blockIdx.x + blockDim.y * blockDim.x * blockIdx.y;
 
 	if (idx >= n_elements)
 		return;
 
-	curand_init(1337, idx, 23 * iter, &state[idx]);
+	curand_init(1337, idx, 0, &state[idx]);
 }
 
 template <typename T>
@@ -135,7 +135,7 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 
 	// Pick random face
 	// TODO: weight by face area
-	float r = fmodf(curand_uniform(crs + idx), 1.0f);
+	float r = fmodf(curand_uniform(&crs[idx]), 1.0f);
 
 	/* 
 	uint32_t faceId = n_faces - 1;
@@ -167,9 +167,9 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 	// Barycentric coordinates
 	T alpha, beta, gamma;
 	// TODO: is this actually uniform??
-	alpha = (T)curand_uniform(crs + idx);
+	alpha = (T)curand_uniform(&crs[idx]);
 	alpha = alpha - (T)(long)alpha;
-	beta = (T)curand_uniform(crs + idx) * ((T)1.0f - (T)alpha);
+	beta = (T)curand_uniform(&crs[idx]) * ((T)1.0f - (T)alpha);
 	beta = beta - (T)(long)beta;
 	gamma = (T)1.0f - alpha - beta;
 
@@ -321,6 +321,11 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 
 		std::cout << "Beginning optimization with " << n_training_steps << " training steps." << std::endl;
 
+		// RNG
+		curandState* crs;
+		cudaMalloc(&crs, sizeof(curandState) * batch_size);
+		linear_kernel(setup_kernel, 0, training_stream, batch_size, crs);
+
 		uint32_t interval = 10;
 
 		for (uint32_t i = 0; i < n_training_steps; ++i) {
@@ -333,23 +338,12 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 			*  ===============================
 			*/
 			{
-				// RNG
-				curandState* crs;
-				cudaMalloc(&crs, sizeof(curandState) * batch_size);
-				linear_kernel(setup_kernel, 0, training_stream, batch_size, crs, i);
-
 				// Generate Surface Points - training input
 				linear_kernel(generate_face_positions<precision_t>, 0, training_stream, batch_size, n_faces, crs, indices->data(), vertices->data(), cdf->data(), training_batch_raw.data());
 				//linear_kernel(rescale_faceIds, 0, training_stream, batch_size, n_faces, training_batch_raw.data(), training_batch.data());
 
 				// Sample reference texture at surface points - training output
 				linear_kernel(generate_training_target, 0, training_stream, batch_size, n_faces, texture, training_batch_raw.data(), indices->data(), texcoords->data(), training_target.data());
-
-				cudaFree(crs);
-
-				// Debug
-				//std::vector<float> in = training_batch.to_cpu_vector();
-				//std::vector<float> out = training_target.to_cpu_vector();
 			}
 
 			/* =========================
@@ -425,6 +419,7 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 
 		*training_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
 
+		cudaFree(crs);
 		free_all_gpu_memory_arenas();
 
 		return res;

@@ -57,17 +57,23 @@ struct FeatureRef{
 	T w2;
 };
 
-__global__ void setup_crs(curandState* state, int iter) {
-
-	int idx = threadIdx.x + blockDim.x * blockIdx.x + blockDim.y * blockDim.x * blockIdx.y;
-	//printf("%i\n", idx);
-
-	curand_init(1337, idx, 0, &state[idx]);
-}
-
 template <typename T>
 __device__ T remap(T x, T lowIn, T highIn, T lowOut, T highOut) {
 	return lowOut + (x - lowIn) * (highOut - lowOut) / (highIn - lowIn);
+}
+
+template <typename T>
+__device__ T mapToBinCenter(T feature, T quant_range, uint32_t n_bins) {
+	// Calculate the width of each bin
+	T bin_width = (quant_range * static_cast<T>(2)) / static_cast<T>(n_bins);
+
+	// Calculate the index of the bin that x falls into
+	uint32_t bin_index = static_cast<uint32_t>((feature + quant_range) / bin_width);
+
+	// Calculate the center of the bin
+	T bin_center = (static_cast<T>(bin_index) * bin_width) + (bin_width / static_cast<T>(2)) - quant_range;
+
+	return bin_center;
 }
 
 template <typename T>
@@ -184,11 +190,9 @@ __global__ void vertex_encoding(
 	if (fQuantEnable) {
 		if (fQuantAddNoise) {
 			// Add uniform noise to simulate quantisation
-			curandState state;
-			curand_init(1337, j * num_instances + i, 3 * iter_count, &state);
-			T offset0 = remap<T>((T)fmodf(curand_uniform(&state), 1.0f), (T)0.f, (T)1.f, -quant_range / (T)n_bins, quant_range / (T)n_bins);
-			T offset1 = remap<T>((T)fmodf(curand_uniform(&state), 1.0f), (T)0.f, (T)1.f, -quant_range / (T)n_bins, quant_range / (T)n_bins);
-			T offset2 = remap<T>((T)fmodf(curand_uniform(&state), 1.0f), (T)0.f, (T)1.f, -quant_range / (T)n_bins, quant_range / (T)n_bins);
+			T offset0 = remap<T>((T)fmodf(curand_uniform(&crs[n_features * fRef.f0 + feature_entry]), 1.0f), (T)0.f, (T)1.f, -quant_range / (T)n_bins, quant_range / (T)n_bins);
+			T offset1 = remap<T>((T)fmodf(curand_uniform(&crs[n_features * fRef.f1 + feature_entry]), 1.0f), (T)0.f, (T)1.f, -quant_range / (T)n_bins, quant_range / (T)n_bins);
+			T offset2 = remap<T>((T)fmodf(curand_uniform(&crs[n_features * fRef.f2 + feature_entry]), 1.0f), (T)0.f, (T)1.f, -quant_range / (T)n_bins, quant_range / (T)n_bins);
 
 			f0 += (T)offset0;
 			f1 += (T)offset1;
@@ -196,12 +200,9 @@ __global__ void vertex_encoding(
 		}
 		else {
 			// Map features to bin centers
-			f0 = (T)floor((float)remap<T>(f0, -quant_range, quant_range, (T)0.f, (T)n_bins));
-			f0 = remap<T>(f0, (T)0.f, (T)n_bins, -quant_range + ((T)0.5f / (T)n_bins), quant_range + ((T)0.5f / (T)n_bins));
-			f1 = (T)floor((float)remap<T>(f1, -quant_range, quant_range, (T)0.f, (T)n_bins));
-			f1 = remap<T>(f0, (T)0.f, (T)n_bins, -quant_range + ((T)0.5f / (T)n_bins), quant_range + ((T)0.5f / (T)n_bins));
-			f2 = (T)floor((float)remap<T>(f2, -quant_range, quant_range, (T)0.f, (T)n_bins));
-			f2 = remap<T>(f0, (T)0.f, (T)n_bins, -quant_range + ((T)0.5f / (T)n_bins), quant_range + ((T)0.5f / (T)n_bins));
+			f0 = mapToBinCenter(f0, quant_range, n_bins);
+			f1 = mapToBinCenter(f1, quant_range, n_bins);
+			f2 = mapToBinCenter(f2, quant_range, n_bins);
 		}
 	}
 
@@ -226,8 +227,9 @@ __global__ void vertex_encoding_backward(
 	uint32_t* meta,
 	MatrixView<const float> data_in,
 	MatrixView<const T> dL_dy,
-	const float* dy_dx
+	const float* dy_dx,
 	//MatrixView<float> dL_dx
+	bool updateWeights
 ) {
 	const uint32_t encoded_index = blockIdx.x * blockDim.x + threadIdx.x;
 	const uint32_t level = blockIdx.y;
@@ -240,7 +242,7 @@ __global__ void vertex_encoding_backward(
 
 	const uint32_t feature_entry = j % n_features;
 
-	if (data_in(0, i) < 0.f) {
+	if (data_in(0, i) < 0.f || !updateWeights) {
 		return;
 	}
 
@@ -283,9 +285,7 @@ class VertexEncoding : public Encoding<T> {
 public:
 	// TODO: remove n_faces parameter
 	VertexEncoding(uint32_t n_features, uint32_t n_levels, uint32_t n_dims_to_encode, uint32_t n_faces, uint32_t n_vertices, uint32_t max_features_per_level, std::vector<tinyobj::index_t> indices)
-		: m_n_features{ n_features }, m_n_levels{ n_levels }, m_n_dims_to_encode{ n_dims_to_encode }, m_n_faces{ n_faces }, m_n_vertices{ n_vertices }, m_max_features_per_level {
-		max_features_per_level
-	}
+		: m_n_features{ n_features }, m_n_levels{ n_levels }, m_n_dims_to_encode{ n_dims_to_encode }, m_n_faces{ n_faces }, m_n_vertices{ n_vertices }, m_max_features_per_level { max_features_per_level }
 	{
 		printf("Vertex Encoding: n_features = %i, n_levels = %i, max_fs_per_level = 2^%i\n", m_n_features, m_n_levels, (int)std::log2(m_max_features_per_level));
 
@@ -295,6 +295,13 @@ public:
 		m_indices.copy_from_host(indices);
 
 		m_n_params = computeFeatureOffset(indices, &m_offset, &m_metadata) * n_features;
+
+		cudaMalloc(&m_crs, sizeof(curandState) * m_n_params);
+		setup_kernel<<<1, m_n_params>>>(m_n_params, m_crs);
+	}
+
+	~VertexEncoding() {
+		cudaFree(m_crs);
 	}
 
 	std::unique_ptr<Context> forward_impl(
@@ -318,15 +325,6 @@ public:
 		const uint32_t N_ELEMENTS = input.n() * m_n_features;
 		const dim3 blocks = { div_round_up(N_ELEMENTS, N_THREADS), div_round_up(padded_output_width(), m_n_features), 1};
 		const uint32_t totalThreads = input.n() * padded_output_width();
-		
-		curandState* crs = nullptr;
-
-		bool do_feature_quant = m_iteration_count < m_n_quant_iterations;
-
-		if (do_feature_quant) {
-			//cudaMalloc((void**)&crs, sizeof(curandState) * totalThreads);
-			//setup_kernel <<<blocks, N_THREADS, 0, stream>>> (totalThreads, crs, (int)m_iteration_count);
-		}
 
 		vertex_encoding<T><<<blocks, N_THREADS, 0, stream>>>(
 			input.n(),
@@ -341,15 +339,12 @@ public:
 			m_metadata.data(),
 			input.view(),
 			output->view(),
-			crs,
+			m_crs,
 			m_n_bins,
 			m_quant_range,
 			m_n_quant_iterations,
 			m_iteration_count
 			);
-
-		if (do_feature_quant)
-			//cudaFree(crs);
 
 		return forward;
 	}
@@ -376,28 +371,27 @@ public:
 		const dim3 blocks = { div_round_up(N_ELEMENTS, N_THREADS), m_n_levels, 1 };
 
 
-		bool update_weights = m_iteration_count < m_n_quant_iterations || m_n_quant_iterations <= 0u;
+		const bool update_weights = m_iteration_count < m_n_quant_iterations || m_n_quant_iterations <= 0u;
 
-		if (update_weights) {
-			vertex_encoding_backward<T> << <blocks, N_THREADS, 0, stream >> > (
-				input.n(),
-				m_n_output_dims,
-				m_n_features,
-				m_n_levels,
-				m_n_faces,
-				m_indices.data(),
-				use_inference_params ? this->inference_params() : this->params(),
-				m_offset.data(),
-				m_metadata.data(),
-				input.view(),
-				dL_doutput.view(),
-				forward.dy_dx.data()
-				//dL_dinput->view()
-				);
-		}
+		vertex_encoding_backward<T> << <blocks, N_THREADS, 0, stream >> > (
+			input.n(),
+			m_n_output_dims,
+			m_n_features,
+			m_n_levels,
+			m_n_faces,
+			m_indices.data(),
+			use_inference_params ? this->inference_params() : this->params(),
+			m_offset.data(),
+			m_metadata.data(),
+			input.view(),
+			dL_doutput.view(),
+			forward.dy_dx.data(),
+			//dL_dinput->view()
+			update_weights
+			);
 		
 		if (m_iteration_count < m_n_quant_iterations) {
-			clamp_features<T> << <1, n_params(), 0, stream >> > (n_params(), use_inference_params ? this->inference_params() : this->params(), m_quant_range);
+			clamp_features<T> <<<1, n_params(), 0, stream>>> (n_params(), use_inference_params ? this->inference_params() : this->params(), m_quant_range);
 		}
 
 		m_iteration_count++;
@@ -465,9 +459,10 @@ private:
 	uint32_t m_n_faces;
 	uint32_t m_n_vertices;
 
+	curandState* m_crs;
 	uint32_t m_n_bins = 16u;				// Number of quantisation bins
 	T m_quant_range = (T)1.0f;				// Quantisation interval [-m_quant_range, m_quant_range]
-	uint32_t m_n_quant_iterations = 4750u;	// Number of training iterations with simulated quantisation
+	uint32_t m_n_quant_iterations = 4750u;		// Number of training iterations with simulated quantisation
 	uint32_t m_iteration_count = 0u;
 
 	GPUMemory<tinyobj::index_t> m_indices;
