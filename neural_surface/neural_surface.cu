@@ -648,7 +648,7 @@ int main(int argc, char* argv[]) {
 
 	uint32_t ns_level[] = {		2, 3, 4, 5, 6, 7,	8, 9, 10,2, 3, 4,	5 ,6 ,7 ,8 ,9 ,10,	2, 3, 4, 5, 6, 7,	8, 9, 10 };
 	uint32_t ns_feature[] = {	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2 };
-	uint32_t max_fs_level[] = { 16,16,16,16,16,16,	16,16,16,17,17,17,	17,17,17,17,17,17,	18,18,18,18,18,18,	18,18,18 };
+	uint32_t max_fs_level[] = { 18,18,18,18,18,18,	18,18,18,19,19,19,	19,19,19,19,19,19,	20,20,20,20,20,20,	20,20,20 };
 
 	std::ofstream outCsv;
 	outCsv.open("evalutation.csv");
@@ -683,7 +683,8 @@ int main(int argc, char* argv[]) {
 			{"n_features", ns_feature[i]},
 			{"n_levels", ns_level[i]},
 			{"max_features_level", 1u << max_fs_level[i]},
-			{"output_construction", "lin_interp"},
+			{"n_quant_bins", 16u},
+			{"n_quant_iterations", 4750u}
 		}},
 		{"network", {
 			{"otype", "FullyFusedMLP"},

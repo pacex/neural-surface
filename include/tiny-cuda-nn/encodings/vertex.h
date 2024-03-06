@@ -284,10 +284,14 @@ template <typename T>
 class VertexEncoding : public Encoding<T> {
 public:
 	// TODO: remove n_faces parameter
-	VertexEncoding(uint32_t n_features, uint32_t n_levels, uint32_t n_dims_to_encode, uint32_t n_faces, uint32_t n_vertices, uint32_t max_features_per_level, std::vector<tinyobj::index_t> indices)
-		: m_n_features{ n_features }, m_n_levels{ n_levels }, m_n_dims_to_encode{ n_dims_to_encode }, m_n_faces{ n_faces }, m_n_vertices{ n_vertices }, m_max_features_per_level { max_features_per_level }
+	VertexEncoding(uint32_t n_features, uint32_t n_levels, uint32_t n_dims_to_encode, uint32_t n_faces, uint32_t n_vertices, uint32_t max_features_per_level, uint32_t n_quant_bins, uint32_t n_quant_iterations, std::vector<tinyobj::index_t> indices)
+		: m_n_features{ n_features }, m_n_levels{ n_levels }, m_n_dims_to_encode{ n_dims_to_encode }, m_n_faces{ n_faces }, m_n_vertices{ n_vertices }, m_max_features_per_level{ max_features_per_level }, m_n_bins{ n_quant_bins }, m_n_quant_iterations{ n_quant_iterations }
 	{
 		printf("Vertex Encoding: n_features = %i, n_levels = %i, max_fs_per_level = 2^%i\n", m_n_features, m_n_levels, (int)std::log2(m_max_features_per_level));
+		if (m_n_quant_iterations == 0)
+			printf("Feature Quantisation: disabled\n");
+		else
+			printf("Feature Quantisation: enabled | n_quant_bins = %i, n_quant_iterations = %i\n", m_n_bins, m_n_quant_iterations);
 
 		m_n_output_dims = n_features * m_n_levels;
 		
@@ -460,9 +464,9 @@ private:
 	uint32_t m_n_vertices;
 
 	curandState* m_crs;
-	uint32_t m_n_bins = 16u;				// Number of quantisation bins
+	uint32_t m_n_bins ;						// Number of quantisation bins
 	T m_quant_range = (T)1.0f;				// Quantisation interval [-m_quant_range, m_quant_range]
-	uint32_t m_n_quant_iterations = 4750u;		// Number of training iterations with simulated quantisation
+	uint32_t m_n_quant_iterations;			// Number of training iterations with simulated quantisation
 	uint32_t m_iteration_count = 0u;
 
 	GPUMemory<tinyobj::index_t> m_indices;
@@ -647,7 +651,7 @@ private:
 template <typename T>
 VertexEncoding<T>* create_vertex_encoding(uint32_t n_dims_to_encode, uint32_t n_vertices, uint32_t n_faces, std::vector<tinyobj::index_t> indices, std::vector<float> vertices, const json& encoding) {
 
-	return new VertexEncoding<T>(encoding.value("n_features", 2u), encoding.value("n_levels", 1u), n_dims_to_encode, n_faces, n_vertices, encoding.value("max_features_level", 1u << 14), indices);
+	return new VertexEncoding<T>(encoding.value("n_features", 2u), encoding.value("n_levels", 1u), n_dims_to_encode, n_faces, n_vertices, encoding.value("max_features_level", 1u << 14), encoding.value("n_quant_bins", 16u), encoding.value("n_quant_iterations", 0u), indices);
 }
 
 }
