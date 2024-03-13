@@ -68,10 +68,10 @@ __device__ T mapToBinCenter(T feature, T quant_range, uint32_t n_bins) {
 	T bin_width = (quant_range * static_cast<T>(2)) / static_cast<T>(n_bins);
 
 	// Calculate the index of the bin that x falls into
-	uint32_t bin_index = static_cast<uint32_t>((feature + quant_range) / bin_width);
+	uint32_t bin_index = static_cast<uint32_t>((feature + quant_range + (bin_width / static_cast<T>(2))) / bin_width);
 
 	// Calculate the center of the bin
-	T bin_center = (static_cast<T>(bin_index) * bin_width) + (bin_width / static_cast<T>(2)) - quant_range;
+	T bin_center = (static_cast<T>(bin_index) * bin_width) - quant_range;
 
 	return bin_center;
 }
@@ -271,12 +271,16 @@ template <typename T>
 __global__ void clamp_features(
 	const uint32_t num_instances,
 	T* features,
-	T quant_range
+	T quant_range,
+	uint32_t n_bins
 ) {
 	const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
 	if (idx >= num_instances) return;
 
-	features[idx] = clamp<T>(features[idx], -quant_range, quant_range - (T)0.0000000001f);
+	// Calculate the width of each bin
+	T bin_width = (quant_range * static_cast<T>(2)) / static_cast<T>(n_bins);
+
+	features[idx] = clamp<T>(features[idx], -quant_range - (bin_width / static_cast<T>(2)), quant_range - (bin_width / static_cast<T>(2)));
 	return;
 }
 
@@ -395,7 +399,7 @@ public:
 			);
 		
 		if (m_iteration_count < m_n_quant_iterations) {
-			clamp_features<T> <<<1, n_params(), 0, stream>>> (n_params(), use_inference_params ? this->inference_params() : this->params(), m_quant_range);
+			clamp_features<T> <<<1, n_params(), 0, stream>>> (n_params(), use_inference_params ? this->inference_params() : this->params(), m_quant_range, m_n_bins);
 		}
 
 		m_iteration_count++;

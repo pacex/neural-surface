@@ -268,7 +268,8 @@ struct EvalResult {
 EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, std::vector<tinyobj::index_t> indices_host,
 	GPUMemory<float>* vertices, std::vector<float> vertices_host, GPUMemory<float>* texcoords, GPUMemory<float>* cdf,
 	cudaTextureObject_t texture,
-	int sampleWidth, int sampleHeight, GPUMemory<float>* test_batch, long* training_time_ms) {
+	int sampleWidth, int sampleHeight, GPUMemory<float>* test_batch, long* training_time_ms,
+	uint32_t training_iterations) {
 	try {
 
 		EvalResult res;
@@ -283,7 +284,7 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 		const uint32_t n_input_dims = N_INPUT_DIMS; // (v1, v2, v3, alpha, beta, gamma)
 		const uint32_t n_output_dims = N_OUTPUT_DIMS; // RGB color
 
-		const uint32_t n_training_steps = 5001;
+		const uint32_t n_training_steps = training_iterations + 1;
 
 		cudaStream_t inference_stream;
 		CUDA_CHECK_THROW(cudaStreamCreate(&inference_stream));
@@ -397,7 +398,9 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 					std::cout << "Evaluation time = " << std::chrono::duration_cast<std::chrono::microseconds>(evalEnd - evalStart).count() << "[microseconds]" << std::endl;
 
 					std::vector<float> debug = prediction.to_cpu_vector();
-					auto filename = fmt::format("images/nl{}_nmf{}_iter{}.jpg", encoding_opts.value("n_levels", 1u), std::log2(encoding_opts.value("max_features_level", 1u << 14)), i);
+					auto filename = fmt::format("images/nl{}_nmf{}_nbins{}_niter{}.jpg",
+						encoding_opts.value("n_levels", 1u), std::log2(encoding_opts.value("max_features_level", 1u << 14)),
+						encoding_opts.value("n_quant_bins", 16u), training_iterations - 5000u);
 					std::cout << "Writing '" << filename << "'... ";
 					save_image(prediction.data(), sampleWidth, sampleHeight, 3, 3, filename);
 					std::cout << "done." << std::endl;
@@ -650,59 +653,65 @@ int main(int argc, char* argv[]) {
 	uint32_t ns_feature[] = {	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2 };
 	uint32_t max_fs_level[] = { 18,18,18,18,18,18,	18,18,18,19,19,19,	19,19,19,19,19,19,	20,20,20,20,20,20,	20,20,20 };
 
-	std::ofstream outCsv;
-	outCsv.open("evalutation.csv");
-	outCsv << "n_levels, n_features, max_fs_level, n_floats, loss, training_time_ms\n";
+	uint32_t ns_bins[] = { 16,16,16,16,			   32,32,32,32,			   64, 64, 64 , 64 };
+	uint32_t ns_iter[] = { 5250, 5500, 5750, 6000, 5250, 5500, 5750, 6000, 5250, 5500, 5750, 6000 };
 
-	for (size_t i = 0; i < n_test_cases; i++) {
+	for (size_t j = 0; j < 12; j++) {
 
-		printf("============================\n");
-		printf("    TEST CASE %i / %i\n", i+1 , n_test_cases);
-		printf("============================\n");
+		std::ofstream outCsv;
+		outCsv.open(fmt::format("evaluation_nbins{}_niter{}.csv", ns_bins[j], ns_iter[j]-5000u));
+		outCsv << "n_levels, n_features, max_fs_level, n_floats, loss, training_time_ms\n";
 
-		json config = {
-		{"loss", {
-			{"otype", "RelativeL2"}
-		}},
-		{"optimizer", {
-			{"otype", "Adam"},
-			// {"otype", "Shampoo"},
-			{"learning_rate", 1e-2},
-			{"beta1", 0.9f},
-			{"beta2", 0.99f},
-			{"l2_reg", 0.0f},
-			// The following parameters are only used when the optimizer is "Shampoo".
-			{"beta3", 0.9f},
-			{"beta_shampoo", 0.0f},
-			{"identity", 0.0001f},
-			{"cg_on_momentum", false},
-			{"frobenius_normalization", true},
-		}},
-		{"encoding", {
-			{"otype", "Vertex"},
-			{"n_features", ns_feature[i]},
-			{"n_levels", ns_level[i]},
-			{"max_features_level", 1u << max_fs_level[i]},
-			{"n_quant_bins", 16u},
-			{"n_quant_iterations", 4750u}
-		}},
-		{"network", {
-			{"otype", "FullyFusedMLP"},
-			// {"otype", "CutlassMLP"},
-			{"n_neurons", 64},
-			{"n_hidden_layers", 4},
-			{"activation", "ReLU"},
-			{"output_activation", "None"},
-		}},
-		};
+		for (size_t i = 0; i < n_test_cases; i++) {
 
-		long training_time_ms;
-		EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf, texture, sampleWidth, sampleHeight, &test_batch, &training_time_ms);
+			printf("============================\n");
+			printf("    TEST CASE %i / %i\n", i + 1, n_test_cases);
+			printf("============================\n");
 
-		outCsv << fmt::format("{},{},{},{},{},{}\n", ns_level[i], ns_feature[i], max_fs_level[i], res.n_floats, res.MSE, training_time_ms);
+			json config = {
+			{"loss", {
+				{"otype", "RelativeL2"}
+			}},
+			{"optimizer", {
+				{"otype", "Adam"},
+				// {"otype", "Shampoo"},
+				{"learning_rate", 1e-2},
+				{"beta1", 0.9f},
+				{"beta2", 0.99f},
+				{"l2_reg", 0.0f},
+				// The following parameters are only used when the optimizer is "Shampoo".
+				{"beta3", 0.9f},
+				{"beta_shampoo", 0.0f},
+				{"identity", 0.0001f},
+				{"cg_on_momentum", false},
+				{"frobenius_normalization", true},
+			}},
+			{"encoding", {
+				{"otype", "Vertex"},
+				{"n_features", ns_feature[i]},
+				{"n_levels", ns_level[i]},
+				{"max_features_level", 1u << max_fs_level[i]},
+				{"n_quant_bins", ns_bins[j]},
+				{"n_quant_iterations", 5000}
+			}},
+			{"network", {
+				{"otype", "FullyFusedMLP"},
+				// {"otype", "CutlassMLP"},
+				{"n_neurons", 64},
+				{"n_hidden_layers", 4},
+				{"activation", "ReLU"},
+				{"output_activation", "None"},
+			}},
+			};
+
+			long training_time_ms;
+			EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf, texture, sampleWidth, sampleHeight, &test_batch, &training_time_ms, ns_iter[j]);
+
+			outCsv << fmt::format("{},{},{},{},{},{}\n", ns_level[i], ns_feature[i], max_fs_level[i], res.n_floats, res.MSE, training_time_ms);
+		}
+
+		outCsv.close();
 	}
-
-	outCsv.close();
 
 	return EXIT_SUCCESS;
 }
