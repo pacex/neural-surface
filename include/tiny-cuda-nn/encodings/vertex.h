@@ -63,15 +63,22 @@ __device__ T remap(T x, T lowIn, T highIn, T lowOut, T highOut) {
 }
 
 template <typename T>
-__device__ T mapToBinCenter(T feature, T quant_range, uint32_t n_bins) {
-	// Calculate the width of each bin
-	T bin_width = (quant_range * static_cast<T>(2)) / static_cast<T>(n_bins);
-
-	// Calculate the index of the bin that x falls into
-	uint32_t bin_index = static_cast<uint32_t>((feature + quant_range + (bin_width / static_cast<T>(2))) / bin_width);
+__device__ T getBinCenter(int q, int z, T s) {
 
 	// Calculate the center of the bin
-	T bin_center = (static_cast<T>(bin_index) * bin_width) - quant_range;
+	T bin_center = s * (static_cast<T>(q - z)/* + static_cast<T>(0.5f)*/);
+
+	return bin_center;
+}
+
+template <typename T>
+__device__ T mapToBinCenter(T feature, int z, T s) {
+
+	// Calculate the index of the bin that feature falls into
+	int q = static_cast<int>(roundf(((float)feature / (float)s + (float)z)));
+
+	// Calculate the center of the bin
+	T bin_center = getBinCenter(q, z, s);
 
 	return bin_center;
 }
@@ -144,7 +151,8 @@ __global__ void vertex_encoding(
 	MatrixView<T> data_out,
 	curandState* crs,
 	const uint32_t n_bins,
-	const T quant_range,
+	const int z,
+	const T s,
 	const uint32_t n_quant_iterations,
 	const uint32_t iter_count)
 {
@@ -190,9 +198,10 @@ __global__ void vertex_encoding(
 	if (fQuantEnable) {
 		if (fQuantAddNoise) {
 			// Add uniform noise to simulate quantisation
-			T offset0 = remap<T>((T)fmodf(curand_uniform(&crs[n_features * fRef.f0 + feature_entry]), 1.0f), (T)0.f, (T)1.f, -quant_range / (T)n_bins, quant_range / (T)n_bins);
-			T offset1 = remap<T>((T)fmodf(curand_uniform(&crs[n_features * fRef.f1 + feature_entry]), 1.0f), (T)0.f, (T)1.f, -quant_range / (T)n_bins, quant_range / (T)n_bins);
-			T offset2 = remap<T>((T)fmodf(curand_uniform(&crs[n_features * fRef.f2 + feature_entry]), 1.0f), (T)0.f, (T)1.f, -quant_range / (T)n_bins, quant_range / (T)n_bins);
+			T half_bin_width = s * static_cast<T>(0.5f);
+			T offset0 = remap<T>((T)fmodf(curand_uniform(&crs[n_features * fRef.f0 + feature_entry]), 1.0f), (T)0.f, (T)1.f, -half_bin_width, half_bin_width);
+			T offset1 = remap<T>((T)fmodf(curand_uniform(&crs[n_features * fRef.f1 + feature_entry]), 1.0f), (T)0.f, (T)1.f, -half_bin_width, half_bin_width);
+			T offset2 = remap<T>((T)fmodf(curand_uniform(&crs[n_features * fRef.f2 + feature_entry]), 1.0f), (T)0.f, (T)1.f, -half_bin_width, half_bin_width);
 
 			f0 += (T)offset0;
 			f1 += (T)offset1;
@@ -200,9 +209,9 @@ __global__ void vertex_encoding(
 		}
 		else {
 			// Map features to bin centers
-			f0 = mapToBinCenter(f0, quant_range, n_bins);
-			f1 = mapToBinCenter(f1, quant_range, n_bins);
-			f2 = mapToBinCenter(f2, quant_range, n_bins);
+			f0 = mapToBinCenter(f0, z, s);
+			f1 = mapToBinCenter(f1, z, s);
+			f2 = mapToBinCenter(f2, z, s);
 		}
 	}
 
@@ -271,16 +280,19 @@ template <typename T>
 __global__ void clamp_features(
 	const uint32_t num_instances,
 	T* features,
-	T quant_range,
+	int z,
+	T s,
 	uint32_t n_bins
 ) {
 	const uint32_t idx = blockIdx.x * blockDim.x + threadIdx.x;
 	if (idx >= num_instances) return;
 
-	// Calculate the width of each bin
-	T bin_width = (quant_range * static_cast<T>(2)) / static_cast<T>(n_bins);
+	// Calculate half width of each bin
+	T half_bin_width = s * static_cast<T>(0.5f);
+	T bin0_low = getBinCenter(0, z, s) - half_bin_width;
+	T binn_high = getBinCenter(n_bins - 1, z, s) + half_bin_width;
 
-	features[idx] = clamp<T>(features[idx], -quant_range - (bin_width / static_cast<T>(2)), quant_range - (bin_width / static_cast<T>(2)));
+	features[idx] = clamp<T>(features[idx], bin0_low, binn_high - static_cast<T>(0.001f));
 	return;
 }
 
@@ -303,6 +315,10 @@ public:
 		m_indices.copy_from_host(indices);
 
 		m_n_params = computeFeatureOffset(indices, &m_offset, &m_metadata) * n_features;
+
+		// Feature Quantisation
+		m_z = (int)m_n_bins / 2;
+		m_s = 2.0f / static_cast<float>(m_n_bins);
 
 		cudaMalloc(&m_crs, sizeof(curandState) * m_n_params);
 		setup_kernel<<<1, m_n_params>>>(m_n_params, m_crs);
@@ -349,7 +365,8 @@ public:
 			output->view(),
 			m_crs,
 			m_n_bins,
-			m_quant_range,
+			m_z,
+			m_s,
 			m_n_quant_iterations,
 			m_iteration_count
 			);
@@ -399,7 +416,8 @@ public:
 			);
 		
 		if (m_iteration_count < m_n_quant_iterations) {
-			clamp_features<T> <<<1, n_params(), 0, stream>>> (n_params(), use_inference_params ? this->inference_params() : this->params(), m_quant_range, m_n_bins);
+			clamp_features<T> <<<1, n_params(), 0, stream>>> (n_params(),
+				use_inference_params ? this->inference_params() : this->params(), m_z, m_s, m_n_bins);
 		}
 
 		m_iteration_count++;
@@ -468,8 +486,10 @@ private:
 	uint32_t m_n_vertices;
 
 	curandState* m_crs;
-	uint32_t m_n_bins ;						// Number of quantisation bins
-	T m_quant_range = (T)1.0f;				// Quantisation interval [-m_quant_range, m_quant_range]
+	uint32_t m_n_bins;						// Number of quantisation bins
+	int m_z;
+	T m_s;
+
 	uint32_t m_n_quant_iterations;			// Number of training iterations with simulated quantisation
 	uint32_t m_iteration_count = 0u;
 

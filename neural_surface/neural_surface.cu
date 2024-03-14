@@ -338,30 +338,30 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 			*  === GENERATE TRAINING BATCH ===
 			*  ===============================
 			*/
-			{
-				// Generate Surface Points - training input
-				linear_kernel(generate_face_positions<precision_t>, 0, training_stream, batch_size, n_faces, crs, indices->data(), vertices->data(), cdf->data(), training_batch_raw.data());
-				//linear_kernel(rescale_faceIds, 0, training_stream, batch_size, n_faces, training_batch_raw.data(), training_batch.data());
+			
+			// Generate Surface Points - training input
+			linear_kernel(generate_face_positions<precision_t>, 0, training_stream, batch_size, n_faces, crs, indices->data(), vertices->data(), cdf->data(), training_batch_raw.data());
+			//linear_kernel(rescale_faceIds, 0, training_stream, batch_size, n_faces, training_batch_raw.data(), training_batch.data());
 
-				// Sample reference texture at surface points - training output
-				linear_kernel(generate_training_target, 0, training_stream, batch_size, n_faces, texture, training_batch_raw.data(), indices->data(), texcoords->data(), training_target.data());
-			}
+			// Sample reference texture at surface points - training output
+			linear_kernel(generate_training_target, 0, training_stream, batch_size, n_faces, texture, training_batch_raw.data(), indices->data(), texcoords->data(), training_target.data());
+			
 
 			/* =========================
 			*  === RUN TRAINING STEP ===
 			*  =========================
 			*/
 
-			{
-				//auto ctx = trainer->training_step(training_stream, training_batch, training_target);
+			
+			//auto ctx = trainer->training_step(training_stream, training_batch, training_target);
 
-				auto ctx_obj = model->training_step(training_stream, training_batch_raw, training_target);
+			auto ctx_obj = model->training_step(training_stream, training_batch_raw, training_target);
 
-				if (i % std::min(interval, (uint32_t)100) == 0) {
-					tmp_loss += model->loss(training_stream, *ctx_obj);
-					++tmp_loss_counter;
-				}
+			if (i % std::min(interval, (uint32_t)100) == 0) {
+				tmp_loss += model->loss(training_stream, *ctx_obj);
+				++tmp_loss_counter;
 			}
+			
 
 
 
@@ -645,18 +645,18 @@ int main(int argc, char* argv[]) {
 	   =========================
 	*/
 
-	uint32_t n_test_cases = 27;
+	uint32_t n_test_cases = 1;
 	//uint32_t ns_level[] = {   1,1,1,1,1, 1,		2,2,2,2,2, 2,	3,3,3,3,3, 3,	4,4,4,4,4, 4,	5,5,5,5,	6,6,6,	7,7 };
 	//uint32_t ns_feature[] = { 1,2,4,8,16,32,	1,2,4,8,16,32,	1,2,4,8,16,32,	1,2,4,8,16,32,	1,2,4,8,	1,2,4,	1,2 };
 
-	uint32_t ns_level[] = {		2, 3, 4, 5, 6, 7,	8, 9, 10,2, 3, 4,	5 ,6 ,7 ,8 ,9 ,10,	2, 3, 4, 5, 6, 7,	8, 9, 10 };
+	uint32_t ns_level[] = {		6, 6, 6, 5, 6, 7,	8, 9, 10,2, 3, 4,	5 ,6 ,7 ,8 ,9 ,10,	2, 3, 4, 5, 6, 7,	8, 9, 10 };
 	uint32_t ns_feature[] = {	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2 };
 	uint32_t max_fs_level[] = { 18,18,18,18,18,18,	18,18,18,19,19,19,	19,19,19,19,19,19,	20,20,20,20,20,20,	20,20,20 };
 
-	uint32_t ns_bins[] = { 16,16,16,16,			   32,32,32,32,			   64, 64, 64 , 64 };
-	uint32_t ns_iter[] = { 5250, 5500, 5750, 6000, 5250, 5500, 5750, 6000, 5250, 5500, 5750, 6000 };
+	uint32_t ns_bins[] = { 32,32,64,16,			   32,32,32,32,			   64, 64, 64 , 64 };
+	uint32_t ns_iter[] = { 5250, 5250, 5250, 6000, 5250, 5500, 5750, 6000, 5250, 5500, 5750, 6000 };
 
-	for (size_t j = 0; j < 12; j++) {
+	for (size_t j = 0; j < 3; j++) {
 
 		std::ofstream outCsv;
 		outCsv.open(fmt::format("evaluation_nbins{}_niter{}.csv", ns_bins[j], ns_iter[j]-5000u));
