@@ -9,3 +9,4 @@ dist
 /*.jpg
 /*.csv
 images/
+data/objects/
