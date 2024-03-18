@@ -55,7 +55,25 @@
 
 using namespace tcnn;
 using precision_t = network_precision_t;
-//using precision_t = float;
+
+struct Texture {
+	cudaTextureObject_t texture;
+	int width;
+	int height;
+	cudaResourceDesc resDesc;
+	cudaTextureDesc texDesc;
+	GPUMemory<float> image;
+};
+
+struct Material {
+	Texture map_Kd;
+	Texture map_Bump;
+};
+
+struct EvalResult {
+	float MSE;
+	uint32_t n_floats;
+};
 
 GPUMemory<float> load_image(const std::string& filename, int& width, int& height) {
 	// width * height * RGBA
@@ -195,7 +213,7 @@ __global__ void rescale_faceIds(uint32_t n_elements, uint32_t n_faces, float* tr
 
 }
 
-__global__ void generate_training_target(uint32_t n_elements, uint32_t n_faces, cudaTextureObject_t texture, float* training_batch, tinyobj::index_t* indices, float* texcoords, float* result) {
+__global__ void generate_training_target(uint32_t n_elements, uint32_t n_faces, Material* materials, int* material_ids, float* training_batch, tinyobj::index_t* indices, float* texcoords, float* result) {
 
 	int idx = threadIdx.x + blockDim.x * blockIdx.x;
 
@@ -237,6 +255,8 @@ __global__ void generate_training_target(uint32_t n_elements, uint32_t n_faces, 
 
 	vec2 uv_interp = w1 * uv1 + w2 * uv2 + w3 * uv3;
 
+	cudaTextureObject_t texture = materials[material_ids[faceId]].map_Kd.texture;
+
 	float4 val = tex2D<float4>(texture, uv_interp.x, uv_interp.y);
 	result[output_idx + 0] = val.x;
 	result[output_idx + 1] = val.y;
@@ -256,14 +276,9 @@ std::vector<std::string> splitString(std::string input, char delimiter) {
 	return result;
 }
 
-struct EvalResult {
-	float MSE;
-	uint32_t n_floats;
-};
-
 EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, std::vector<tinyobj::index_t> indices_host,
 	GPUMemory<float>* vertices, std::vector<float> vertices_host, GPUMemory<float>* texcoords, GPUMemory<float>* cdf,
-	cudaTextureObject_t texture,
+	GPUMemory<Material>* materials, GPUMemory<int>* material_ids,
 	int sampleWidth, int sampleHeight, GPUMemory<float>* test_batch, long* training_time_ms) {
 	try {
 
@@ -339,7 +354,7 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 				//linear_kernel(rescale_faceIds, 0, training_stream, batch_size, n_faces, training_batch_raw.data(), training_batch.data());
 
 				// Sample reference texture at surface points - training output
-				linear_kernel(generate_training_target, 0, training_stream, batch_size, n_faces, texture, training_batch_raw.data(), indices->data(), texcoords->data(), training_target.data());
+				linear_kernel(generate_training_target, 0, training_stream, batch_size, n_faces, materials->data(), material_ids->data(), training_batch_raw.data(), indices->data(), texcoords->data(), training_target.data());
 
 				cudaFree(crs);
 
@@ -431,6 +446,29 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 
 }
 
+void loadTexture(std::string path, Texture* tex) {
+
+	tex->image = load_image(path, tex->width, tex->height);
+
+	// Second step: create a cuda texture out of this image. It'll be used to generate training data efficiently on the fly
+	memset(&tex->resDesc, 0, sizeof(tex->resDesc));
+	tex->resDesc.resType = cudaResourceTypePitch2D;
+	tex->resDesc.res.pitch2D.devPtr = tex->image.data();
+	tex->resDesc.res.pitch2D.desc = cudaCreateChannelDesc(32, 32, 32, 32, cudaChannelFormatKindFloat);
+	tex->resDesc.res.pitch2D.width = tex->width;
+	tex->resDesc.res.pitch2D.height = tex->height;
+	tex->resDesc.res.pitch2D.pitchInBytes = tex->width * 4 * sizeof(float);
+
+	memset(&tex->texDesc, 0, sizeof(tex->texDesc));
+	tex->texDesc.filterMode = cudaFilterModeLinear;
+	tex->texDesc.normalizedCoords = true;
+	tex->texDesc.addressMode[0] = cudaAddressModeClamp;
+	tex->texDesc.addressMode[1] = cudaAddressModeClamp;
+	tex->texDesc.addressMode[2] = cudaAddressModeClamp;
+
+	CUDA_CHECK_THROW(cudaCreateTextureObject(&tex->texture, &tex->resDesc, &tex->texDesc, nullptr));
+}
+
 int main(int argc, char* argv[]) {
 	
 	uint32_t compute_capability = cuda_compute_capability();
@@ -459,8 +497,9 @@ int main(int argc, char* argv[]) {
 	*  =========================
 	*/
 
-	std::string object_path = "data/objects/barramundifish.obj";
-	std::string texture_path = "data/objects/BarramundiFish_baseColor.png";
+	std::string object_basedir = "data/objects/barramundifish/";
+	std::string object_path = object_basedir + "barramundifish.obj";
+	std::string texture_path = object_basedir + "BarramundiFish_baseColor.png";
 	std::string sample_path = "data/objects/sample_fish.csv";
 
 
@@ -472,11 +511,11 @@ int main(int argc, char* argv[]) {
 	std::cout << "Loading " << object_path << "..." << std::flush;
 	tinyobj::attrib_t attrib;
 	std::vector<tinyobj::shape_t> shapes;
-	std::vector<tinyobj::material_t> materials;
+	std::vector<tinyobj::material_t> mats;
 	std::string err;
 	std::string warn;
 	// Expect '.mtl' file in the same directory and triangulate meshes
-	bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err, object_path.c_str());
+	bool ret = tinyobj::LoadObj(&attrib, &shapes, &mats, &warn, &err, object_path.c_str(), object_basedir.c_str());
 	if (!err.empty())
 	{ // `err` may contain warning message.
 		std::cerr << err << std::endl;
@@ -492,27 +531,28 @@ int main(int argc, char* argv[]) {
 	}
 
 	int shapeIndex = 0;
+	tinyobj::mesh_t mesh = shapes[shapeIndex].mesh;
 	int n_vertices = attrib.vertices.size() / 3;
 	int n_texcoords = attrib.texcoords.size() / 2;
 
-	int n_indices = shapes[shapeIndex].mesh.indices.size();
+	int n_indices = mesh.indices.size();
 	int n_faces = n_indices / 3;
 
 	// Generate histogram of face areas to sample surface points
 	std::vector<float> histogram(n_faces);
 	float area_sum = 0.f;
 	for (size_t i = 0; i < n_faces; i++) {
-		vec3 v1(attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 0].vertex_index + 0],
-			attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 0].vertex_index + 1],
-			attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 0].vertex_index + 2]);
+		vec3 v1(attrib.vertices[3 * mesh.indices[3 * i + 0].vertex_index + 0],
+			attrib.vertices[3 * mesh.indices[3 * i + 0].vertex_index + 1],
+			attrib.vertices[3 * mesh.indices[3 * i + 0].vertex_index + 2]);
 
-		vec3 v2(attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 1].vertex_index + 0],
-			attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 1].vertex_index + 1],
-			attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 1].vertex_index + 2]);
+		vec3 v2(attrib.vertices[3 * mesh.indices[3 * i + 1].vertex_index + 0],
+			attrib.vertices[3 * mesh.indices[3 * i + 1].vertex_index + 1],
+			attrib.vertices[3 * mesh.indices[3 * i + 1].vertex_index + 2]);
 
-		vec3 v3(attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 2].vertex_index + 0],
-			attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 2].vertex_index + 1],
-			attrib.vertices[3 * shapes[shapeIndex].mesh.indices[3 * i + 2].vertex_index + 2]);
+		vec3 v3(attrib.vertices[3 * mesh.indices[3 * i + 2].vertex_index + 0],
+			attrib.vertices[3 * mesh.indices[3 * i + 2].vertex_index + 1],
+			attrib.vertices[3 * mesh.indices[3 * i + 2].vertex_index + 2]);
 
 		float area = 0.5f * length(cross(v2 - v1, v3 - v1));
 		histogram[i] = area;
@@ -539,14 +579,29 @@ int main(int argc, char* argv[]) {
 	std::vector<tinyobj::index_t> indices_host = shapes[shapeIndex].mesh.indices;
 	indices.copy_from_host(indices_host);
 
-	/* ==============================
-	*  === LOAD REFERENCE TEXTURE ===
-	*  ==============================
+	/* ==========================
+	*  === LOAD MATERIAL DATA ===
+	*  ==========================
 	*/
+	int n_materials = mats.size();
+	std::vector<Material> materials_host(n_materials);
+	GPUMemory<Material> materials(n_materials);
+	GPUMemory<int> material_ids(n_faces);
 
+	for (int i = 0; i < n_materials; i++) {
+		loadTexture(object_basedir + mats[i].diffuse_texname, &materials_host[i].map_Kd);
+		loadTexture(object_basedir + mats[i].bump_texname, &materials_host[i].map_Bump);
+	}
+
+	materials.copy_from_host(materials_host);
+	material_ids.copy_from_host(mesh.material_ids);
+
+
+	/*
 	int width, height;
 	GPUMemory<float> image = load_image(texture_path, width, height);
 
+	
 	// Second step: create a cuda texture out of this image. It'll be used to generate training data efficiently on the fly
 	cudaResourceDesc resDesc;
 	memset(&resDesc, 0, sizeof(resDesc));
@@ -567,6 +622,8 @@ int main(int argc, char* argv[]) {
 
 	cudaTextureObject_t texture;
 	CUDA_CHECK_THROW(cudaCreateTextureObject(&texture, &resDesc, &texDesc, nullptr));
+	*/
+	
 
 	/* =======================
 	*  === LOAD TEST INPUT ===
@@ -628,7 +685,7 @@ int main(int argc, char* argv[]) {
 		CUDA_CHECK_THROW(cudaStreamCreate(&test_generator_stream));
 		GPUMatrix<float> test_generator_batch(test_batch.data(), 3, sampleWidth * sampleHeight);
 		GPUMatrix<float> test_generator_result(3, sampleWidth * sampleHeight);
-		linear_kernel(generate_training_target, 0, test_generator_stream, sampleWidth * sampleHeight, n_faces, texture, test_generator_batch.data(), indices.data(), texcoords.data(), test_generator_result.data());
+		linear_kernel(generate_training_target, 0, test_generator_stream, sampleWidth * sampleHeight, n_faces, materials.data(), material_ids.data(), test_generator_batch.data(), indices.data(), texcoords.data(), test_generator_result.data());
 
 		auto filename = "images/data_generator_test.jpg";
 		std::cout << "Writing '" << filename << "'... ";
@@ -697,7 +754,7 @@ int main(int argc, char* argv[]) {
 		};
 
 		long training_time_ms;
-		EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf, texture, sampleWidth, sampleHeight, &test_batch, &training_time_ms);
+		EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf, &materials, &material_ids, sampleWidth, sampleHeight, &test_batch, &training_time_ms);
 
 		outCsv << fmt::format("{},{},{},{},{},{}\n", ns_level[i], ns_feature[i], max_fs_level[i], res.n_floats, res.MSE, training_time_ms);
 	}
