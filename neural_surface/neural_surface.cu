@@ -75,6 +75,10 @@ struct EvalResult {
 	uint32_t n_floats;
 };
 
+
+#define N_INPUT_DIMS 3
+#define N_OUTPUT_DIMS 6
+
 GPUMemory<float> load_image(const std::string& filename, int& width, int& height) {
 	// width * height * RGBA
 	float* out = load_stbi(&width, &height, filename.c_str());
@@ -87,25 +91,33 @@ GPUMemory<float> load_image(const std::string& filename, int& width, int& height
 }
 
 template <typename T>
-__global__ void to_ldr(const uint64_t num_elements, const uint32_t n_channels, const uint32_t stride, const T* __restrict__ in, uint8_t* __restrict__ out) {
+__global__ void to_ldr(const uint64_t num_elements, const uint32_t n_channels, const uint32_t stride, const uint32_t offset, const T* __restrict__ in, uint8_t* __restrict__ out) {
 	const uint64_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= num_elements) return;
 
 	const uint64_t pixel = i / n_channels;
-	const uint32_t channel = i - pixel * n_channels;
+	const uint32_t channel = i - pixel * n_channels + offset;
 
 	out[i] = (uint8_t)(powf(fmaxf(fminf(in[pixel * stride + channel], 1.0f), 0.0f), 1.0f/2.2f) * 255.0f + 0.5f);
 }
 
 template <typename T>
-void save_image(const T* image, int width, int height, int n_channels, int channel_stride, const std::string& filename) {
+void save_image(const T* image, int width, int height, int n_channels, int channel_stride, int channel_offset, const std::string& filename) {
 	GPUMemory<uint8_t> image_ldr(width * height * n_channels);
-	linear_kernel(to_ldr<T>, 0, nullptr, width * height * n_channels, n_channels, channel_stride, image, image_ldr.data());
+	linear_kernel(to_ldr<T>, 0, nullptr, width * height * n_channels, n_channels, channel_stride, channel_offset, image, image_ldr.data());
 
 	std::vector<uint8_t> image_ldr_host(width * height * n_channels);
 	CUDA_CHECK_THROW(cudaMemcpy(image_ldr_host.data(), image_ldr.data(), image_ldr.size(), cudaMemcpyDeviceToHost));
 
 	save_stbi(image_ldr_host.data(), width, height, n_channels, filename.c_str());
+}
+
+template <typename T>
+void save_images(const T* data, int width, int height, const std::string& filename) {
+
+	for (int i = 0; i < N_OUTPUT_DIMS / 3; i++) {
+		save_image(data, width, height, 3, N_OUTPUT_DIMS, i * 3, fmt::format("images/ch{}_", i) + filename);
+	}
 }
 
 template <uint32_t stride>
@@ -127,9 +139,6 @@ __global__ void eval_image(uint32_t n_elements, cudaTextureObject_t texture, flo
 }
 
 // Generate training data
-
-#define N_INPUT_DIMS 3;
-#define N_OUTPUT_DIMS 3;
 
 __global__ void setup_kernel(uint32_t n_elements, curandState* state, int iter) {
 
@@ -220,8 +229,8 @@ __global__ void generate_training_target(uint32_t n_elements, uint32_t n_faces, 
 	if (idx >= n_elements)
 		return;
 
-	int input_idx = idx * 3;
-	int output_idx = idx * 3;
+	int input_idx = idx * N_INPUT_DIMS;
+	int output_idx = idx * N_OUTPUT_DIMS;
 
 	int iv1, iv2, iv3, faceId;
 	float w1, w2, w3;
@@ -255,12 +264,19 @@ __global__ void generate_training_target(uint32_t n_elements, uint32_t n_faces, 
 
 	vec2 uv_interp = w1 * uv1 + w2 * uv2 + w3 * uv3;
 
-	cudaTextureObject_t texture = materials[material_ids[faceId]].map_Kd.texture;
+	// This needs to match N_OUTPUT_DIMS
+	cudaTextureObject_t texture_diffuse = materials[material_ids[faceId]].map_Kd.texture;
+	cudaTextureObject_t texture_bump = materials[material_ids[faceId]].map_Bump.texture;
 
-	float4 val = tex2D<float4>(texture, uv_interp.x, uv_interp.y);
-	result[output_idx + 0] = val.x;
-	result[output_idx + 1] = val.y;
-	result[output_idx + 2] = val.z;
+	float4 val_diff = tex2D<float4>(texture_diffuse, uv_interp.x, uv_interp.y);
+	result[output_idx + 0] = val_diff.x;
+	result[output_idx + 1] = val_diff.y;
+	result[output_idx + 2] = val_diff.z;
+
+	float4 val_bump = tex2D<float4>(texture_bump, uv_interp.x, uv_interp.y);
+	result[output_idx + 3] = val_bump.x;
+	result[output_idx + 4] = val_bump.y;
+	result[output_idx + 5] = val_bump.z;
 
 }
 
@@ -291,8 +307,6 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 
 			// Various constants for the network and optimization
 		const uint32_t batch_size = 1 << 18;
-		const uint32_t n_input_dims = N_INPUT_DIMS; // (v1, v2, v3, alpha, beta, gamma)
-		const uint32_t n_output_dims = N_OUTPUT_DIMS; // RGB color
 
 		const uint32_t n_training_steps = 5001;
 
@@ -303,9 +317,9 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 		default_rng_t rng{ 1337 };
 		// Auxiliary matrices for training
 
-		GPUMatrix<float> training_batch_raw(n_input_dims, batch_size);
-		GPUMatrix<float> training_batch(n_input_dims, batch_size);
-		GPUMatrix<float> training_target(n_output_dims, batch_size);
+		GPUMatrix<float> training_batch_raw(N_INPUT_DIMS, batch_size);
+		GPUMatrix<float> training_batch(N_INPUT_DIMS, batch_size);
+		GPUMatrix<float> training_target(N_OUTPUT_DIMS, batch_size);
 
 		json encoding_opts = config.value("encoding", json::object());
 		json loss_opts = config.value("loss", json::object());
@@ -317,8 +331,8 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 
 		std::shared_ptr<Loss<precision_t>> loss{ create_loss<precision_t>(loss_opts) };
 		std::shared_ptr<Optimizer<precision_t>> optimizer{ create_optimizer<precision_t>(optimizer_opts) };
-		std::shared_ptr<Encoding<precision_t>> encoding{ create_vertex_encoding<precision_t>(n_input_dims, n_vertices, n_faces, indices_host, vertices_host, encoding_opts) };
-		std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(encoding, n_output_dims, network_opts);
+		std::shared_ptr<Encoding<precision_t>> encoding{ create_vertex_encoding<precision_t>(N_INPUT_DIMS, n_vertices, n_faces, indices_host, vertices_host, encoding_opts) };
+		std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(encoding, N_OUTPUT_DIMS, network_opts);
 		//std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(std::shared_ptr<Encoding<precision_t>>{create_encoding<precision_t>(n_input_dims, encoding_opts)}, n_output_dims, network_opts);
 
 		auto model = std::make_shared<Trainer<float, precision_t, precision_t>>(network, optimizer, loss);
@@ -401,22 +415,20 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 				if (visualize_learned_func) {
 
 					// Auxiliary matrices for evaluation
-					GPUMatrix<float> prediction(n_output_dims, sampleWidth * sampleHeight);
-					GPUMatrix<float> inference_batch_raw(test_batch->data(), n_input_dims, sampleWidth * sampleHeight);
-					GPUMatrix<float> inference_batch(n_input_dims, sampleWidth * sampleHeight);
-					linear_kernel(rescale_faceIds, 0, inference_stream, sampleWidth * sampleHeight, n_faces, inference_batch_raw.data(), inference_batch.data());
+					GPUMatrix<float> prediction(N_OUTPUT_DIMS, sampleWidth * sampleHeight);
+					GPUMatrix<float> inference_batch(test_batch->data(), N_INPUT_DIMS, sampleWidth * sampleHeight);
 
 					cudaThreadSynchronize();
 					std::chrono::steady_clock::time_point evalStart = std::chrono::steady_clock::now();
-					network->inference(inference_stream, inference_batch_raw, prediction);
+					network->inference(inference_stream, inference_batch, prediction);
 					cudaThreadSynchronize();
 					std::chrono::steady_clock::time_point evalEnd = std::chrono::steady_clock::now();
 					std::cout << "Evaluation time = " << std::chrono::duration_cast<std::chrono::microseconds>(evalEnd - evalStart).count() << "[microseconds]" << std::endl;
 
 					std::vector<float> debug = prediction.to_cpu_vector();
-					auto filename = fmt::format("images/nl{}_nmf{}_iter{}.jpg", encoding_opts.value("n_levels", 1u), std::log2(encoding_opts.value("max_features_level", 1u << 14)), i);
+					auto filename = fmt::format("nl{}_nmf{}_iter{}.jpg", encoding_opts.value("n_levels", 1u), std::log2(encoding_opts.value("max_features_level", 1u << 14)), i);
 					std::cout << "Writing '" << filename << "'... ";
-					save_image(prediction.data(), sampleWidth, sampleHeight, 3, 3, filename);
+					save_images(prediction.data(), sampleWidth, sampleHeight, filename);
 					std::cout << "done." << std::endl;
 				}
 
@@ -683,13 +695,13 @@ int main(int argc, char* argv[]) {
 			
 		cudaStream_t test_generator_stream;
 		CUDA_CHECK_THROW(cudaStreamCreate(&test_generator_stream));
-		GPUMatrix<float> test_generator_batch(test_batch.data(), 3, sampleWidth * sampleHeight);
-		GPUMatrix<float> test_generator_result(3, sampleWidth * sampleHeight);
+		GPUMatrix<float> test_generator_batch(test_batch.data(), N_OUTPUT_DIMS, sampleWidth * sampleHeight);
+		GPUMatrix<float> test_generator_result(N_OUTPUT_DIMS, sampleWidth * sampleHeight);
 		linear_kernel(generate_training_target, 0, test_generator_stream, sampleWidth * sampleHeight, n_faces, materials.data(), material_ids.data(), test_generator_batch.data(), indices.data(), texcoords.data(), test_generator_result.data());
 
-		auto filename = "images/data_generator_test.jpg";
+		auto filename = "data_generator_test.jpg";
 		std::cout << "Writing '" << filename << "'... ";
-		save_image(test_generator_result.data(), sampleWidth, sampleHeight, 3, 3, filename);
+		save_images(test_generator_result.data(), sampleWidth, sampleHeight, filename);
 		std::cout << "done." << std::endl;
 			
 	}
