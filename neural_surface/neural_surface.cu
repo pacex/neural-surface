@@ -103,6 +103,8 @@ __global__ void to_ldr(const uint64_t num_elements, const uint32_t n_channels, c
 
 template <typename T>
 void save_image(const T* image, int width, int height, int n_channels, int channel_stride, int channel_offset, const std::string& filename) {
+
+	std::cout << filename << "... " << std::endl;
 	GPUMemory<uint8_t> image_ldr(width * height * n_channels);
 	linear_kernel(to_ldr<T>, 0, nullptr, width * height * n_channels, n_channels, channel_stride, channel_offset, image, image_ldr.data());
 
@@ -115,9 +117,11 @@ void save_image(const T* image, int width, int height, int n_channels, int chann
 template <typename T>
 void save_images(const T* data, int width, int height, const std::string& filename) {
 
+	std::cout << "Writing image files... " << std::endl;
 	for (int i = 0; i < N_OUTPUT_DIMS / 3; i++) {
 		save_image(data, width, height, 3, N_OUTPUT_DIMS, i * 3, fmt::format("images/ch{}_", i) + filename);
 	}
+	std::cout << "Done." << std::endl;
 }
 
 template <uint32_t stride>
@@ -140,10 +144,14 @@ __global__ void eval_image(uint32_t n_elements, cudaTextureObject_t texture, flo
 
 // Generate training data
 
-__global__ void setup_kernel(uint32_t n_elements, curandState* state, int iter) {
+__global__ void setup_kernel(uint32_t n_elements, curandState* state) {
 
-	int idx = threadIdx.x + blockDim.x * blockIdx.x;
-	curand_init(1337 + iter, idx, 0, &state[idx]);
+	int idx = threadIdx.x + blockDim.x * blockIdx.x + blockDim.y * blockDim.x * blockIdx.y;
+
+	if (idx >= n_elements)
+		return;
+
+	curand_init(1337, idx, 0, &state[idx]);
 }
 
 template <typename T>
@@ -158,7 +166,7 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 
 	// Pick random face
 	// TODO: weight by face area
-	float r = fmodf(curand_uniform(crs + idx), 1.0f);
+	float r = fmodf(curand_uniform(&crs[idx]), 1.0f);
 
 	/* 
 	uint32_t faceId = n_faces - 1;
@@ -190,9 +198,9 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 	// Barycentric coordinates
 	T alpha, beta, gamma;
 	// TODO: is this actually uniform??
-	alpha = (T)curand_uniform(crs + idx);
+	alpha = (T)curand_uniform(&crs[idx]);
 	alpha = alpha - (T)(long)alpha;
-	beta = (T)curand_uniform(crs + idx) * ((T)1.0f - (T)alpha);
+	beta = (T)curand_uniform(&crs[idx]) * ((T)1.0f - (T)alpha);
 	beta = beta - (T)(long)beta;
 	gamma = (T)1.0f - alpha - beta;
 
@@ -295,7 +303,8 @@ std::vector<std::string> splitString(std::string input, char delimiter) {
 EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, std::vector<tinyobj::index_t> indices_host,
 	GPUMemory<float>* vertices, std::vector<float> vertices_host, GPUMemory<float>* texcoords, GPUMemory<float>* cdf,
 	GPUMemory<Material>* materials, GPUMemory<int>* material_ids,
-	int sampleWidth, int sampleHeight, GPUMemory<float>* test_batch, long* training_time_ms) {
+	int sampleWidth, int sampleHeight, GPUMemory<float>* test_batch, long* training_time_ms,
+	uint32_t training_iterations) {
 	try {
 
 		EvalResult res;
@@ -308,7 +317,7 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 			// Various constants for the network and optimization
 		const uint32_t batch_size = 1 << 18;
 
-		const uint32_t n_training_steps = 5001;
+		const uint32_t n_training_steps = training_iterations + 1;
 
 		cudaStream_t inference_stream;
 		CUDA_CHECK_THROW(cudaStreamCreate(&inference_stream));
@@ -346,6 +355,11 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 
 		std::cout << "Beginning optimization with " << n_training_steps << " training steps." << std::endl;
 
+		// RNG
+		curandState* crs;
+		cudaMalloc(&crs, sizeof(curandState) * batch_size);
+		linear_kernel(setup_kernel, 0, training_stream, batch_size, crs);
+
 		uint32_t interval = 10;
 
 		for (uint32_t i = 0; i < n_training_steps; ++i) {
@@ -357,41 +371,29 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 			*  === GENERATE TRAINING BATCH ===
 			*  ===============================
 			*/
-			{
-				// RNG
-				curandState* crs;
-				cudaMalloc(&crs, sizeof(curandState) * batch_size);
-				linear_kernel(setup_kernel, 0, training_stream, batch_size, crs, i);
-
-				// Generate Surface Points - training input
-				linear_kernel(generate_face_positions<precision_t>, 0, training_stream, batch_size, n_faces, crs, indices->data(), vertices->data(), cdf->data(), training_batch_raw.data());
-				//linear_kernel(rescale_faceIds, 0, training_stream, batch_size, n_faces, training_batch_raw.data(), training_batch.data());
+			
+			// Generate Surface Points - training input
+			linear_kernel(generate_face_positions<precision_t>, 0, training_stream, batch_size, n_faces, crs, indices->data(), vertices->data(), cdf->data(), training_batch_raw.data());
+			//linear_kernel(rescale_faceIds, 0, training_stream, batch_size, n_faces, training_batch_raw.data(), training_batch.data());
 
 				// Sample reference texture at surface points - training output
 				linear_kernel(generate_training_target, 0, training_stream, batch_size, n_faces, materials->data(), material_ids->data(), training_batch_raw.data(), indices->data(), texcoords->data(), training_target.data());
-
-				cudaFree(crs);
-
-				// Debug
-				//std::vector<float> in = training_batch.to_cpu_vector();
-				//std::vector<float> out = training_target.to_cpu_vector();
-			}
 
 			/* =========================
 			*  === RUN TRAINING STEP ===
 			*  =========================
 			*/
 
-			{
-				//auto ctx = trainer->training_step(training_stream, training_batch, training_target);
+			
+			//auto ctx = trainer->training_step(training_stream, training_batch, training_target);
 
-				auto ctx_obj = model->training_step(training_stream, training_batch_raw, training_target);
+			auto ctx_obj = model->training_step(training_stream, training_batch_raw, training_target);
 
-				if (i % std::min(interval, (uint32_t)100) == 0) {
-					tmp_loss += model->loss(training_stream, *ctx_obj);
-					++tmp_loss_counter;
-				}
+			if (i % std::min(interval, (uint32_t)100) == 0) {
+				tmp_loss += model->loss(training_stream, *ctx_obj);
+				++tmp_loss_counter;
 			}
+			
 
 
 
@@ -426,10 +428,10 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 					std::cout << "Evaluation time = " << std::chrono::duration_cast<std::chrono::microseconds>(evalEnd - evalStart).count() << "[microseconds]" << std::endl;
 
 					std::vector<float> debug = prediction.to_cpu_vector();
-					auto filename = fmt::format("nl{}_nmf{}_iter{}.jpg", encoding_opts.value("n_levels", 1u), std::log2(encoding_opts.value("max_features_level", 1u << 14)), i);
-					std::cout << "Writing '" << filename << "'... ";
+					auto filename = fmt::format("nl{}_nmf{}_nbins{}_niter{}.jpg",
+						encoding_opts.value("n_levels", 1u), std::log2(encoding_opts.value("max_features_level", 1u << 14)),
+						encoding_opts.value("n_quant_bins", 16u), training_iterations - 5000u);
 					save_images(prediction.data(), sampleWidth, sampleHeight, filename);
-					std::cout << "done." << std::endl;
 				}
 
 				
@@ -448,6 +450,7 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 
 		*training_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - begin).count();
 
+		cudaFree(crs);
 		free_all_gpu_memory_arenas();
 
 		return res;
@@ -700,9 +703,7 @@ int main(int argc, char* argv[]) {
 		linear_kernel(generate_training_target, 0, test_generator_stream, sampleWidth * sampleHeight, n_faces, materials.data(), material_ids.data(), test_generator_batch.data(), indices.data(), texcoords.data(), test_generator_result.data());
 
 		auto filename = "data_generator_test.jpg";
-		std::cout << "Writing '" << filename << "'... ";
 		save_images(test_generator_result.data(), sampleWidth, sampleHeight, filename);
-		std::cout << "done." << std::endl;
 			
 	}
 
@@ -720,58 +721,68 @@ int main(int argc, char* argv[]) {
 	uint32_t ns_feature[] = {	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2 };
 	uint32_t max_fs_level[] = { 16,16,16,16,16,16,	16,16,16,17,17,17,	17,17,17,17,17,17,	18,18,18,18,18,18,	18,18,18 };
 
-	std::ofstream outCsv;
-	outCsv.open("evalutation.csv");
-	outCsv << "n_levels, n_features, max_fs_level, n_floats, loss, training_time_ms\n";
+	uint32_t ns_bins[] = { 32,32,64,16,			   32,32,32,32,			   64, 64, 64 , 64 };
+	uint32_t ns_iter[] = { 5250, 5250, 5250, 6000, 5250, 5500, 5750, 6000, 5250, 5500, 5750, 6000 };
 
-	for (size_t i = 0; i < n_test_cases; i++) {
+	for (size_t j = 0; j < 1; j++) {
 
-		printf("============================\n");
-		printf("    TEST CASE %i / %i\n", i+1 , n_test_cases);
-		printf("============================\n");
+		std::ofstream outCsv;
+		std::string csvFileName = fmt::format("evaluation_nbins{}_niter{}.csv", ns_bins[j], ns_iter[j] - 5000u);
+		csvFileName = "evaluation_moreChannels.csv";
+		outCsv.open(csvFileName);
+		outCsv << "n_levels, n_features, max_fs_level, n_floats, loss, training_time_ms\n";
 
-		json config = {
-		{"loss", {
-			{"otype", "RelativeL2"}
-		}},
-		{"optimizer", {
-			{"otype", "Adam"},
-			// {"otype", "Shampoo"},
-			{"learning_rate", 1e-2},
-			{"beta1", 0.9f},
-			{"beta2", 0.99f},
-			{"l2_reg", 0.0f},
-			// The following parameters are only used when the optimizer is "Shampoo".
-			{"beta3", 0.9f},
-			{"beta_shampoo", 0.0f},
-			{"identity", 0.0001f},
-			{"cg_on_momentum", false},
-			{"frobenius_normalization", true},
-		}},
-		{"encoding", {
-			{"otype", "Vertex"},
-			{"n_features", ns_feature[i]},
-			{"n_levels", ns_level[i]},
-			{"max_features_level", 1u << max_fs_level[i]},
-			{"output_construction", "lin_interp"},
-		}},
-		{"network", {
-			{"otype", "FullyFusedMLP"},
-			// {"otype", "CutlassMLP"},
-			{"n_neurons", 64},
-			{"n_hidden_layers", 4},
-			{"activation", "ReLU"},
-			{"output_activation", "None"},
-		}},
-		};
+		for (size_t i = 0; i < n_test_cases; i++) {
+
+			printf("============================\n");
+			printf("    TEST CASE %i / %i\n", i + 1, n_test_cases);
+			printf("============================\n");
+
+			json config = {
+			{"loss", {
+				{"otype", "RelativeL2"}
+			}},
+			{"optimizer", {
+				{"otype", "Adam"},
+				// {"otype", "Shampoo"},
+				{"learning_rate", 1e-2},
+				{"beta1", 0.9f},
+				{"beta2", 0.99f},
+				{"l2_reg", 0.0f},
+				// The following parameters are only used when the optimizer is "Shampoo".
+				{"beta3", 0.9f},
+				{"beta_shampoo", 0.0f},
+				{"identity", 0.0001f},
+				{"cg_on_momentum", false},
+				{"frobenius_normalization", true},
+			}},
+			{"encoding", {
+				{"otype", "Vertex"},
+				{"n_features", ns_feature[i]},
+				{"n_levels", ns_level[i]},
+				{"max_features_level", 1u << max_fs_level[i]},
+				{"n_quant_bins", ns_bins[j]},
+				{"n_quant_iterations", 0}
+			}},
+			{"network", {
+				{"otype", "FullyFusedMLP"},
+				// {"otype", "CutlassMLP"},
+				{"n_neurons", 64},
+				{"n_hidden_layers", 4},
+				{"activation", "ReLU"},
+				{"output_activation", "None"},
+			}},
+			};
 
 		long training_time_ms;
-		EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf, &materials, &material_ids, sampleWidth, sampleHeight, &test_batch, &training_time_ms);
+		EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf,
+			&materials, &material_ids, sampleWidth, sampleHeight, &test_batch, &training_time_ms, /*ns_iter[j]*/5000);
 
-		outCsv << fmt::format("{},{},{},{},{},{}\n", ns_level[i], ns_feature[i], max_fs_level[i], res.n_floats, res.MSE, training_time_ms);
+			outCsv << fmt::format("{},{},{},{},{},{}\n", ns_level[i], ns_feature[i], max_fs_level[i], res.n_floats, res.MSE, training_time_ms);
+		}
+
+		outCsv.close();
 	}
-
-	outCsv.close();
 
 	return EXIT_SUCCESS;
 }
