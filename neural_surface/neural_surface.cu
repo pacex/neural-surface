@@ -535,10 +535,10 @@ int main(int argc, char* argv[]) {
 	*  =========================
 	*/
 
-	std::string object_basedir = "data/objects/barramundifish/";
-	std::string object_path = object_basedir + "barramundifish.obj";
+	std::string object_basedir = "data/objects/sponza/";
+	std::string object_path = object_basedir + "sponza.obj";
 	//std::string texture_path = object_basedir + "BarramundiFish_baseColor.png";
-	std::string sample_path = "data/objects/sample_fish.csv";
+	std::string sample_path = "data/objects/sample_sponza.csv";
 
 
 	/* ======================

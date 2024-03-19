@@ -501,6 +501,15 @@ private:
 	uint32_t m_n_output_dims;
 	uint32_t m_n_to_pad = 0;
 
+	struct Edge {
+		uint32_t toVertex;
+		uint32_t subdiv;
+		uint32_t offset;
+		Edge(uint32_t toVertex, uint32_t subdiv, uint32_t offset) : toVertex(toVertex), subdiv(subdiv), offset(offset) {
+
+		}
+	};
+
 	uint32_t computeFeatureOffset(std::vector<tinyobj::index_t> indices, GPUMemory<uint32_t>* offset, GPUMemory<uint32_t>* meta) {
 
 		/* Precompute offset of feature vectors in memory
@@ -557,9 +566,9 @@ private:
 			for (size_t i = 0; i < m_n_vertices; i++)
 				verts[i] = 0xffffffff;
 
-			std::vector<uint32_t> edges(m_n_vertices * m_n_vertices * n_subdiv);
-			for (size_t i = 0; i < m_n_vertices * m_n_vertices * n_subdiv; i++)
-				edges[i] = 0xffffffff;
+			std::vector<std::vector<Edge*>> edges(m_n_vertices);
+			for (size_t i = 0; i < m_n_vertices; i++)
+				edges[i] = std::vector<Edge*>();
 
 			for (size_t j = 0; j < m_n_faces; j++) { // At each level: Iterate over faces
 
@@ -595,6 +604,25 @@ private:
 						uint32_t e1 = W0 == 0 ? std::min(v1, v2) : (W1 == 0 ? std::min(v0, v2) : std::min(v0, v1));
 						uint32_t W = e0 == v0 ? W0 : (e0 == v1 ? W1 : W2);
 
+						bool found = false;
+						for (size_t e = 0; e < edges[e0].size(); e++) {
+							Edge* candidate = edges[e0][e];
+							if (candidate->toVertex == e1 && candidate->subdiv == W - 1) {
+								// Seen before -> reference assigned feature
+								offset_host[j * face_stride + level_offset + f] = candidate->offset;
+								found = true;
+								break;
+							}
+						}
+						if (!found) {
+							// Not seen before -> assign new unique feature
+							offset_host[j * face_stride + level_offset + f] = unique_feature;
+							Edge* toE1 = new Edge(e1, W - 1, unique_feature);
+							edges[e0].push_back(toE1);
+							unique_feature++;
+						}
+
+						/*
 						if (edges[e0 * m_n_vertices * n_subdiv + e1 * n_subdiv + W - 1] == 0xffffffff) { // Not seen before -> assign new unique feature
 							offset_host[j * face_stride + level_offset + f] = unique_feature;
 							edges[e0 * m_n_vertices * n_subdiv + e1 * n_subdiv + W - 1] = unique_feature;
@@ -602,7 +630,7 @@ private:
 						}
 						else { // Seen before -> reference assigned feature
 							offset_host[j * face_stride + level_offset + f] = edges[e0 * m_n_vertices * n_subdiv + e1 * n_subdiv + W - 1];
-						}
+						}*/
 					}
 
 					// Non-shared feature -> new unique feature
