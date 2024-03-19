@@ -57,6 +57,7 @@ using namespace tcnn;
 using precision_t = network_precision_t;
 
 struct Texture {
+	bool valid;
 	cudaTextureObject_t texture;
 	int width;
 	int height;
@@ -66,6 +67,7 @@ struct Texture {
 };
 
 struct Material {
+	float diffuse[3];
 	Texture map_Kd;
 	Texture map_Bump;
 };
@@ -273,18 +275,31 @@ __global__ void generate_training_target(uint32_t n_elements, uint32_t n_faces, 
 	vec2 uv_interp = w1 * uv1 + w2 * uv2 + w3 * uv3;
 
 	// This needs to match N_OUTPUT_DIMS
-	cudaTextureObject_t texture_diffuse = materials[material_ids[faceId]].map_Kd.texture;
-	cudaTextureObject_t texture_bump = materials[material_ids[faceId]].map_Bump.texture;
 
-	float4 val_diff = tex2D<float4>(texture_diffuse, uv_interp.x, uv_interp.y);
-	result[output_idx + 0] = val_diff.x;
-	result[output_idx + 1] = val_diff.y;
-	result[output_idx + 2] = val_diff.z;
-
-	float4 val_bump = tex2D<float4>(texture_bump, uv_interp.x, uv_interp.y);
-	result[output_idx + 3] = val_bump.x;
-	result[output_idx + 4] = val_bump.y;
-	result[output_idx + 5] = val_bump.z;
+	if (materials[material_ids[faceId]].map_Kd.valid) {
+		cudaTextureObject_t texture_diffuse = materials[material_ids[faceId]].map_Kd.texture;
+		float4 val_diff = tex2D<float4>(texture_diffuse, uv_interp.x, uv_interp.y);
+		result[output_idx + 0] = val_diff.x;
+		result[output_idx + 1] = val_diff.y;
+		result[output_idx + 2] = val_diff.z;
+	}
+	else {
+		result[output_idx + 0] = materials[material_ids[faceId]].diffuse[0];
+		result[output_idx + 1] = materials[material_ids[faceId]].diffuse[1];
+		result[output_idx + 2] = materials[material_ids[faceId]].diffuse[2];
+	}
+	if (materials[material_ids[faceId]].map_Bump.valid) {
+		cudaTextureObject_t texture_bump = materials[material_ids[faceId]].map_Bump.texture;
+		float4 val_bump = tex2D<float4>(texture_bump, uv_interp.x, uv_interp.y);
+		result[output_idx + 3] = val_bump.x;
+		result[output_idx + 4] = val_bump.y;
+		result[output_idx + 5] = val_bump.z;
+	}
+	else {
+		result[output_idx + 3] = 0.5f;
+		result[output_idx + 4] = 0.5f;
+		result[output_idx + 5] = 1.0f;
+	}
 
 }
 
@@ -463,7 +478,13 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 
 void loadTexture(std::string path, Texture* tex) {
 
-	tex->image = load_image(path, tex->width, tex->height);
+	try {
+		tex->image = load_image(path, tex->width, tex->height);
+	}
+	catch (const std::exception& e) {
+		tex->valid = false;
+		return;
+	}
 
 	// Second step: create a cuda texture out of this image. It'll be used to generate training data efficiently on the fly
 	memset(&tex->resDesc, 0, sizeof(tex->resDesc));
@@ -482,6 +503,8 @@ void loadTexture(std::string path, Texture* tex) {
 	tex->texDesc.addressMode[2] = cudaAddressModeClamp;
 
 	CUDA_CHECK_THROW(cudaCreateTextureObject(&tex->texture, &tex->resDesc, &tex->texDesc, nullptr));
+
+	tex->valid = true;
 }
 
 int main(int argc, char* argv[]) {
@@ -514,7 +537,7 @@ int main(int argc, char* argv[]) {
 
 	std::string object_basedir = "data/objects/barramundifish/";
 	std::string object_path = object_basedir + "barramundifish.obj";
-	std::string texture_path = object_basedir + "BarramundiFish_baseColor.png";
+	//std::string texture_path = object_basedir + "BarramundiFish_baseColor.png";
 	std::string sample_path = "data/objects/sample_fish.csv";
 
 
@@ -604,6 +627,9 @@ int main(int argc, char* argv[]) {
 	GPUMemory<int> material_ids(n_faces);
 
 	for (int i = 0; i < n_materials; i++) {
+		materials_host[i].diffuse[0] = mats[i].diffuse[0];
+		materials_host[i].diffuse[1] = mats[i].diffuse[1];
+		materials_host[i].diffuse[2] = mats[i].diffuse[2];
 		loadTexture(object_basedir + mats[i].diffuse_texname, &materials_host[i].map_Kd);
 		loadTexture(object_basedir + mats[i].bump_texname, &materials_host[i].map_Bump);
 	}
@@ -719,7 +745,7 @@ int main(int argc, char* argv[]) {
 
 	uint32_t ns_level[] = {		2, 3, 4, 5, 6, 7,	8, 9, 10,2, 3, 4,	5 ,6 ,7 ,8 ,9 ,10,	2, 3, 4, 5, 6, 7,	8, 9, 10 };
 	uint32_t ns_feature[] = {	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2 };
-	uint32_t max_fs_level[] = { 16,16,16,16,16,16,	16,16,16,17,17,17,	17,17,17,17,17,17,	18,18,18,18,18,18,	18,18,18 };
+	uint32_t max_fs_level[] = { 18,18,18,18,18,18,	18,18,18,19,19,19,	19,19,19,19,19,19,	20,20,20,20,20,20,	20,20,20 };
 
 	uint32_t ns_bins[] = { 32,32,64,16,			   32,32,32,32,			   64, 64, 64 , 64 };
 	uint32_t ns_iter[] = { 5250, 5250, 5250, 6000, 5250, 5500, 5750, 6000, 5250, 5500, 5750, 6000 };
