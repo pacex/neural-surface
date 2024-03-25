@@ -535,10 +535,10 @@ int main(int argc, char* argv[]) {
 	*  =========================
 	*/
 
-	std::string object_basedir = "data/objects/sponza/";
-	std::string object_path = object_basedir + "sponza.obj";
+	std::string object_basedir = "data/objects/barramundifish/";
+	std::string object_path = object_basedir + "barramundifish.obj";
 	//std::string texture_path = object_basedir + "BarramundiFish_baseColor.png";
-	std::string sample_path = "data/objects/sample_sponza.csv";
+	std::string sample_path = "data/objects/sample_fish.csv";
 
 
 	/* ======================
@@ -636,35 +636,6 @@ int main(int argc, char* argv[]) {
 
 	materials.copy_from_host(materials_host);
 	material_ids.copy_from_host(mesh.material_ids);
-
-
-	/*
-	int width, height;
-	GPUMemory<float> image = load_image(texture_path, width, height);
-
-	
-	// Second step: create a cuda texture out of this image. It'll be used to generate training data efficiently on the fly
-	cudaResourceDesc resDesc;
-	memset(&resDesc, 0, sizeof(resDesc));
-	resDesc.resType = cudaResourceTypePitch2D;
-	resDesc.res.pitch2D.devPtr = image.data();
-	resDesc.res.pitch2D.desc = cudaCreateChannelDesc(32, 32, 32, 32, cudaChannelFormatKindFloat);
-	resDesc.res.pitch2D.width = width;
-	resDesc.res.pitch2D.height = height;
-	resDesc.res.pitch2D.pitchInBytes = width * 4 * sizeof(float);
-
-	cudaTextureDesc texDesc;
-	memset(&texDesc, 0, sizeof(texDesc));
-	texDesc.filterMode = cudaFilterModeLinear;
-	texDesc.normalizedCoords = true;
-	texDesc.addressMode[0] = cudaAddressModeClamp;
-	texDesc.addressMode[1] = cudaAddressModeClamp;
-	texDesc.addressMode[2] = cudaAddressModeClamp;
-
-	cudaTextureObject_t texture;
-	CUDA_CHECK_THROW(cudaCreateTextureObject(&texture, &resDesc, &texDesc, nullptr));
-	*/
-	
 
 	/* =======================
 	*  === LOAD TEST INPUT ===
