@@ -66,7 +66,7 @@ template <typename T>
 __device__ T getBinCenter(int q, int z, T s) {
 
 	// Calculate the center of the bin
-	T bin_center = s * (static_cast<T>(q - z)/* + static_cast<T>(0.5f)*/);
+	T bin_center = s * (static_cast<T>(q - z) - static_cast<T>(0.5f));
 
 	return bin_center;
 }
@@ -75,7 +75,7 @@ template <typename T>
 __device__ T mapToBinCenter(T feature, int z, T s) {
 
 	// Calculate the index of the bin that feature falls into
-	int q = static_cast<int>(roundf(((float)feature / (float)s + (float)z)));
+	int q = static_cast<int>(roundf(((float)feature / (float)s + (float)z + 0.5f)));
 
 	// Calculate the center of the bin
 	T bin_center = getBinCenter(q, z, s);
