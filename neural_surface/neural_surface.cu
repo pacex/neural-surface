@@ -645,22 +645,24 @@ int main(int argc, char* argv[]) {
 	   =========================
 	*/
 
-	uint32_t n_test_cases = 27;
+	uint32_t n_test_cases = 13;
 	//uint32_t ns_level[] = {   1,1,1,1,1, 1,		2,2,2,2,2, 2,	3,3,3,3,3, 3,	4,4,4,4,4, 4,	5,5,5,5,	6,6,6,	7,7 };
 	//uint32_t ns_feature[] = { 1,2,4,8,16,32,	1,2,4,8,16,32,	1,2,4,8,16,32,	1,2,4,8,16,32,	1,2,4,8,	1,2,4,	1,2 };
 
-	uint32_t ns_level[] = {		2, 3, 4, 5, 6, 7,	8, 9, 10,2, 3, 4,	5 ,6 ,7 ,8 ,9 ,10,	2, 3, 4, 5, 6, 7,	8, 9, 10 };
-	uint32_t ns_feature[] = {	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2 };
-	uint32_t max_fs_level[] = { 18,18,18,18,18,18,	18,18,18,19,19,19,	19,19,19,19,19,19,	20,20,20,20,20,20,	20,20,20 };
+	uint32_t ns_level[] = {		3, 4, 5, 6, 7, 8,	3, 4, 5 ,6 ,7, 8,	3, 4, 5, 6, 7, 8};
+	uint32_t ns_feature[] = {	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2};
+	uint32_t ns_bins[] = {      4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
 
-	uint32_t ns_bins[] = { 32,32,64,16,			   32,32,32,32,			   64, 64, 64 , 64 };
-	uint32_t ns_iter[] = { 5250, 5250, 5250, 6000, 5250, 5500, 5750, 6000, 5250, 5500, 5750, 6000 };
+	uint32_t max_fs_level[] = { 18,18,18,18,18,18,	19,19,19,19,19,19,	20,20,20,20,20,20,	20,20,20,20,20,20,	20,20,20 };
 
-	for (size_t j = 0; j < 1; j++) {
+	
+	uint32_t ns_iter[] = { 0, 5250, 5500, 5750, 6000 };
+
+	for (size_t j = 0; j < 5; j++) {
 
 		std::ofstream outCsv;
-		outCsv.open(fmt::format("evaluation_nbins{}_niter{}.csv", ns_bins[j], ns_iter[j]-5000u));
-		outCsv << "n_levels, n_features, max_fs_level, n_floats, loss, training_time_ms\n";
+		outCsv.open(fmt::format("evaluation_niter{}.csv", ns_iter[j]-5000u));
+		outCsv << "n_levels, n_features, max_fs_level, quant_bits, n_floats, loss, training_time_ms\n";
 
 		for (size_t i = 0; i < n_test_cases; i++) {
 
@@ -688,11 +690,11 @@ int main(int argc, char* argv[]) {
 			}},
 			{"encoding", {
 				{"otype", "Vertex"},
-				{"n_features", ns_feature[i]},
-				{"n_levels", ns_level[i]},
-				{"max_features_level", 1u << max_fs_level[i]},
-				{"n_quant_bins", ns_bins[j]},
-				{"n_quant_iterations", 0}
+				{"n_features", 2},
+				{"n_levels", 7},
+				{"max_features_level", 1u << 20},
+				{"n_quant_bins", 1u << ns_bins[i]},
+				{"n_quant_iterations", ns_iter[j] == 0 ? 0 : 5000}
 			}},
 			{"network", {
 				{"otype", "FullyFusedMLP"},
@@ -706,9 +708,9 @@ int main(int argc, char* argv[]) {
 
 			long training_time_ms;
 			EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf,
-				texture, sampleWidth, sampleHeight, &test_batch, &training_time_ms, /*ns_iter[j]*/5000);
+				texture, sampleWidth, sampleHeight, &test_batch, &training_time_ms, ns_iter[j] == 0 ? 5000 : ns_iter[j]);
 
-			outCsv << fmt::format("{},{},{},{},{},{}\n", ns_level[i], ns_feature[i], max_fs_level[i], res.n_floats, res.MSE, training_time_ms);
+			outCsv << fmt::format("{},{},{},{},{},{},{}\n", 7, 2, 20, 1u << ns_bins[i], res.n_floats, res.MSE, training_time_ms);
 		}
 
 		outCsv.close();
