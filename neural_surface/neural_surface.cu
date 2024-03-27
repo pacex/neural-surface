@@ -278,7 +278,7 @@ __global__ void generate_training_target(uint32_t n_elements, uint32_t n_faces, 
 
 	if (materials[material_ids[faceId]].map_Kd.valid) {
 		cudaTextureObject_t texture_diffuse = materials[material_ids[faceId]].map_Kd.texture;
-		float4 val_diff = tex2D<float4>(texture_diffuse, uv_interp.x, uv_interp.y);
+		float4 val_diff = tex2D<float4>(texture_diffuse, uv_interp.x, 1.0f - uv_interp.y);
 		result[output_idx + 0] = val_diff.x;
 		result[output_idx + 1] = val_diff.y;
 		result[output_idx + 2] = val_diff.z;
@@ -290,7 +290,7 @@ __global__ void generate_training_target(uint32_t n_elements, uint32_t n_faces, 
 	}
 	if (materials[material_ids[faceId]].map_Bump.valid) {
 		cudaTextureObject_t texture_bump = materials[material_ids[faceId]].map_Bump.texture;
-		float4 val_bump = tex2D<float4>(texture_bump, uv_interp.x, uv_interp.y);
+		float4 val_bump = tex2D<float4>(texture_bump, uv_interp.x, 1.0f - uv_interp.y);
 		result[output_idx + 3] = val_bump.x;
 		result[output_idx + 4] = val_bump.y;
 		result[output_idx + 5] = val_bump.z;
@@ -442,7 +442,7 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 					std::chrono::steady_clock::time_point evalEnd = std::chrono::steady_clock::now();
 					std::cout << "Evaluation time = " << std::chrono::duration_cast<std::chrono::microseconds>(evalEnd - evalStart).count() << "[microseconds]" << std::endl;
 
-					std::vector<float> debug = prediction.to_cpu_vector();
+
 					auto filename = fmt::format("nl{}_nmf{}_nbins{}_niter{}.jpg",
 						encoding_opts.value("n_levels", 1u), std::log2(encoding_opts.value("max_features_level", 1u << 14)),
 						encoding_opts.value("n_quant_bins", 16u), training_iterations - 5000u);
@@ -538,7 +538,7 @@ int main(int argc, char* argv[]) {
 	std::string object_basedir = "data/objects/barramundifish/";
 	std::string object_path = object_basedir + "barramundifish.obj";
 	//std::string texture_path = object_basedir + "BarramundiFish_baseColor.png";
-	std::string sample_path = "data/objects/sample_fish.csv";
+	std::string sample_path = "data/objects/sample_fish_uv.csv";
 
 
 	/* ======================
@@ -695,7 +695,7 @@ int main(int argc, char* argv[]) {
 			
 		cudaStream_t test_generator_stream;
 		CUDA_CHECK_THROW(cudaStreamCreate(&test_generator_stream));
-		GPUMatrix<float> test_generator_batch(test_batch.data(), N_OUTPUT_DIMS, sampleWidth * sampleHeight);
+		GPUMatrix<float> test_generator_batch(test_batch.data(), N_INPUT_DIMS, sampleWidth * sampleHeight);
 		GPUMatrix<float> test_generator_result(N_OUTPUT_DIMS, sampleWidth * sampleHeight);
 		linear_kernel(generate_training_target, 0, test_generator_stream, sampleWidth * sampleHeight, n_faces, materials.data(), material_ids.data(), test_generator_batch.data(), indices.data(), texcoords.data(), test_generator_result.data());
 
