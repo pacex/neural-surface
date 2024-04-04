@@ -398,9 +398,9 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 					std::cout << "Evaluation time = " << std::chrono::duration_cast<std::chrono::microseconds>(evalEnd - evalStart).count() << "[microseconds]" << std::endl;
 
 					std::vector<float> debug = prediction.to_cpu_vector();
-					auto filename = fmt::format("images/nl{}_nmf{}_nbins{}_niter{}.jpg",
-						encoding_opts.value("n_levels", 1u), std::log2(encoding_opts.value("max_features_level", 1u << 14)),
-						encoding_opts.value("n_quant_bins", 16u), training_iterations - 5000u);
+					auto filename = fmt::format("images/nl{}_nf{}_nQuantBits{}_niter{}.jpg",
+						encoding_opts.value("n_levels", 1u), encoding_opts.value("n_features", 2u),
+						std::log2(encoding_opts.value("n_quant_bins", 16u)), training_iterations - 5000u);
 					std::cout << "Writing '" << filename << "'... ";
 					save_image(prediction.data(), sampleWidth, sampleHeight, 3, 3, filename);
 					std::cout << "done." << std::endl;
@@ -645,13 +645,13 @@ int main(int argc, char* argv[]) {
 	   =========================
 	*/
 
-	uint32_t n_test_cases = 13;
-	//uint32_t ns_level[] = {   1,1,1,1,1, 1,		2,2,2,2,2, 2,	3,3,3,3,3, 3,	4,4,4,4,4, 4,	5,5,5,5,	6,6,6,	7,7 };
+	uint32_t n_test_cases = 3;
+	//uint32_t ns_level[] = {   1, 2, 4, 8, 16, 32, 64};
 	//uint32_t ns_feature[] = { 1,2,4,8,16,32,	1,2,4,8,16,32,	1,2,4,8,16,32,	1,2,4,8,16,32,	1,2,4,8,	1,2,4,	1,2 };
 
 	uint32_t ns_level[] = {		3, 4, 5, 6, 7, 8,	3, 4, 5 ,6 ,7, 8,	3, 4, 5, 6, 7, 8};
-	uint32_t ns_feature[] = {	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2,	2, 2, 2, 2, 2, 2};
-	uint32_t ns_bins[] = {      4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+	uint32_t ns_feature[] = {	1,2,4,8,16,32,64};
+	uint32_t ns_bins[] = {      16, 8, 4};
 
 	uint32_t max_fs_level[] = { 18,18,18,18,18,18,	19,19,19,19,19,19,	20,20,20,20,20,20,	20,20,20,20,20,20,	20,20,20 };
 
@@ -661,7 +661,7 @@ int main(int argc, char* argv[]) {
 	for (size_t j = 0; j < 5; j++) {
 
 		std::ofstream outCsv;
-		outCsv.open(fmt::format("evaluation_niter{}.csv", ns_iter[j]-5000u));
+		outCsv.open(fmt::format("evaluation_bitsPerFV{}.csv", ns_bins[0] * ns_feature[j]));
 		outCsv << "n_levels, n_features, max_fs_level, quant_bits, n_floats, loss, training_time_ms\n";
 
 		for (size_t i = 0; i < n_test_cases; i++) {
@@ -690,11 +690,11 @@ int main(int argc, char* argv[]) {
 			}},
 			{"encoding", {
 				{"otype", "Vertex"},
-				{"n_features", 2},
+				{"n_features", ns_feature[i + j]},
 				{"n_levels", 7},
 				{"max_features_level", 1u << 20},
 				{"n_quant_bins", 1u << ns_bins[i]},
-				{"n_quant_iterations", ns_iter[j] == 0 ? 0 : 5000}
+				{"n_quant_iterations", 5000}
 			}},
 			{"network", {
 				{"otype", "FullyFusedMLP"},
@@ -708,9 +708,9 @@ int main(int argc, char* argv[]) {
 
 			long training_time_ms;
 			EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf,
-				texture, sampleWidth, sampleHeight, &test_batch, &training_time_ms, ns_iter[j] == 0 ? 5000 : ns_iter[j]);
+				texture, sampleWidth, sampleHeight, &test_batch, &training_time_ms, 5500);
 
-			outCsv << fmt::format("{},{},{},{},{},{},{}\n", 7, 2, 20, 1u << ns_bins[i], res.n_floats, res.MSE, training_time_ms);
+			outCsv << fmt::format("{},{},{},{},{},{},{}\n", 7, ns_feature[i + j], 20, 1u << ns_bins[i], res.n_floats, res.MSE, training_time_ms);
 		}
 
 		outCsv.close();
