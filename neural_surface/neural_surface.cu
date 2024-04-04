@@ -33,6 +33,8 @@
 #include <tiny-cuda-nn/config.h>
 
 #include <stbi/stbi_wrapper.h>
+#include <stbi/stb_image.h>
+#include <stbi/stb_image_write.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -52,6 +54,8 @@
 
 #define TINYOBJLOADER_IMPLEMENTATION
 #include "tiny_obj_loader.h"
+
+
 
 using namespace tcnn;
 using precision_t = network_precision_t;
@@ -93,35 +97,43 @@ GPUMemory<float> load_image(const std::string& filename, int& width, int& height
 }
 
 template <typename T>
-__global__ void to_ldr(const uint64_t num_elements, const uint32_t n_channels, const uint32_t stride, const uint32_t offset, const T* __restrict__ in, uint8_t* __restrict__ out) {
+__global__ void to_ldr(const uint64_t num_elements, const uint32_t n_channels, const uint32_t stride, const uint32_t offset, const T* __restrict__ in, const float* mask, uint8_t* __restrict__ out) {
 	const uint64_t i = threadIdx.x + blockIdx.x * blockDim.x;
 	if (i >= num_elements) return;
 
-	const uint64_t pixel = i / n_channels;
-	const uint32_t channel = i - pixel * n_channels + offset;
+	const uint64_t pixel = i / 4;
+	const uint32_t channel = i - pixel * 4;
 
-	out[i] = (uint8_t)(powf(fmaxf(fminf(in[pixel * stride + channel], 1.0f), 0.0f), 1.0f/2.2f) * 255.0f + 0.5f);
+	if (channel < n_channels)
+		out[i] = (uint8_t)(powf(fmaxf(fminf(in[pixel * stride + channel + offset], 1.0f), 0.0f), 1.0f / 2.2f) * 255.0f + 0.5f);
+	else if (channel < 3)
+		out[i] = (uint8_t)0;
+	else 
+		out[i] = (mask[pixel * N_INPUT_DIMS + 1] < 0.0f || mask[pixel * N_INPUT_DIMS + 2] < 0.0f) ? (uint8_t)0 : (uint8_t)255;
 }
 
 template <typename T>
-void save_image(const T* image, int width, int height, int n_channels, int channel_stride, int channel_offset, const std::string& filename) {
+void save_image(const T* image, const float* mask, int width, int height, int n_channels, int channel_stride, int channel_offset, const std::string& filename) {
 
 	std::cout << filename << "... " << std::endl;
-	GPUMemory<uint8_t> image_ldr(width * height * n_channels);
-	linear_kernel(to_ldr<T>, 0, nullptr, width * height * n_channels, n_channels, channel_stride, channel_offset, image, image_ldr.data());
+	GPUMemory<uint8_t> image_ldr(width * height * 4);
+	linear_kernel(to_ldr<T>, 0, nullptr, width * height * 4, n_channels, channel_stride, channel_offset, image, mask, image_ldr.data());
 
-	std::vector<uint8_t> image_ldr_host(width * height * n_channels);
+	std::vector<uint8_t> image_ldr_host(width * height * 4);
 	CUDA_CHECK_THROW(cudaMemcpy(image_ldr_host.data(), image_ldr.data(), image_ldr.size(), cudaMemcpyDeviceToHost));
 
-	save_stbi(image_ldr_host.data(), width, height, n_channels, filename.c_str());
+	//save_stbi(image_ldr_host.data(), width, height, n_channels, filename.c_str());
+	if (stbi_write_png(filename.c_str(), width, height, 4, image_ldr_host.data(), width * sizeof(uint8_t) * 4) == 0) {
+		throw std::runtime_error{ fmt::format("Failed to write image {}", filename.c_str()) };
+	}
 }
 
 template <typename T>
-void save_images(const T* data, int width, int height, const std::string& filename) {
+void save_images(const T* data, const float* mask, int width, int height, const std::string& filename) {
 
 	std::cout << "Writing image files... " << std::endl;
 	for (int i = 0; i < N_OUTPUT_DIMS / 3; i++) {
-		save_image(data, width, height, 3, N_OUTPUT_DIMS, i * 3, fmt::format("images/ch{}_", i) + filename);
+		save_image(data, mask, width, height, 3, N_OUTPUT_DIMS, i * 3, fmt::format("images/ch{}_", i) + filename);
 	}
 	std::cout << "Done." << std::endl;
 }
@@ -443,10 +455,10 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 					std::cout << "Evaluation time = " << std::chrono::duration_cast<std::chrono::microseconds>(evalEnd - evalStart).count() << "[microseconds]" << std::endl;
 
 
-					auto filename = fmt::format("nl{}_nmf{}_nbins{}_niter{}.jpg",
+					auto filename = fmt::format("nl{}_nmf{}_nbins{}_niter{}.png",
 						encoding_opts.value("n_levels", 1u), std::log2(encoding_opts.value("max_features_level", 1u << 14)),
 						encoding_opts.value("n_quant_bins", 16u), training_iterations - 5000u);
-					save_images(prediction.data(), sampleWidth, sampleHeight, filename);
+					save_images(prediction.data(), inference_batch.data(), sampleWidth, sampleHeight, filename);
 				}
 
 				
@@ -538,7 +550,7 @@ int main(int argc, char* argv[]) {
 	std::string object_basedir = "data/objects/barramundifish/";
 	std::string object_path = object_basedir + "barramundifish.obj";
 	//std::string texture_path = object_basedir + "BarramundiFish_baseColor.png";
-	std::string sample_path = "data/objects/sample_fish_uv.csv";
+	std::string sample_path = "data/objects/sample_fish_uv_2k.csv";
 
 
 	/* ======================
@@ -699,8 +711,8 @@ int main(int argc, char* argv[]) {
 		GPUMatrix<float> test_generator_result(N_OUTPUT_DIMS, sampleWidth * sampleHeight);
 		linear_kernel(generate_training_target, 0, test_generator_stream, sampleWidth * sampleHeight, n_faces, materials.data(), material_ids.data(), test_generator_batch.data(), indices.data(), texcoords.data(), test_generator_result.data());
 
-		auto filename = "data_generator_test.jpg";
-		save_images(test_generator_result.data(), sampleWidth, sampleHeight, filename);
+		auto filename = "data_generator_test.png";
+		save_images(test_generator_result.data(), test_generator_batch.data(), sampleWidth, sampleHeight, filename);
 			
 	}
 
