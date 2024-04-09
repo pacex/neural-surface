@@ -179,7 +179,6 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 	int output_idx = idx * 3;
 
 	// Pick random face
-	// TODO: weight by face area
 	float r = fmodf(curand_uniform(&crs[idx]), 1.0f);
 
 	/* 
@@ -194,36 +193,15 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 	*/
 
 	uint32_t faceId = (uint32_t)(r * n_faces);
-
-
-	int iv1, iv2, iv3; // Indices of adjacent vertices
-	iv1 = indices[3 * faceId + 0].vertex_index;
-	iv2 = indices[3 * faceId + 1].vertex_index;
-	iv3 = indices[3 * faceId + 2].vertex_index;
-	//assert(iv1 == indices[3 * faceId + 0].texcoord_index);
-	//assert(iv2 == indices[3 * faceId + 1].texcoord_index);
-	//assert(iv3 == indices[3 * faceId + 2].texcoord_index);
-
 	result[output_idx + 0] = *((float*) &faceId);
-	//result[output_idx + 0] = (float)iv1;
-	//result[output_idx + 1] = (float)iv2;
-	//result[output_idx + 2] = (float)iv3;
 
-	// Barycentric coordinates
-	T alpha, beta, gamma;
-	// TODO: is this actually uniform??
-	alpha = (T)curand_uniform(&crs[idx]);
-	alpha = alpha - (T)(long)alpha;
-	beta = (T)curand_uniform(&crs[idx]) * ((T)1.0f - (T)alpha);
-	beta = beta - (T)(long)beta;
-	gamma = (T)1.0f - alpha - beta;
+	// Sample Barycentric coordinates on picked face
+	float r1, r2;
+	r1 = curand_uniform(&crs[idx]);
+	r2 = curand_uniform(&crs[idx]);
 
-
-	result[output_idx + 1] = (float)alpha;
-	result[output_idx + 2] = (float)beta;
-	//result[output_idx + 3] = alpha;
-	//result[output_idx + 4] = beta;
-	//result[output_idx + 5] = gamma;
+	result[output_idx + 1] = 1.0f - sqrt(r1);
+	result[output_idx + 2] = sqrt(r1) * (1.0f - r2);
 }
 
 __global__ void rescale_faceIds(uint32_t n_elements, uint32_t n_faces, float* training_batch, float* result) {
@@ -256,12 +234,6 @@ __global__ void generate_training_target(uint32_t n_elements, uint32_t n_faces, 
 
 	int iv1, iv2, iv3, faceId;
 	float w1, w2, w3;
-	//iv1 = (int)training_batch[input_idx + 0];
-	//iv2 = (int)training_batch[input_idx + 1];
-	//iv3 = (int)training_batch[input_idx + 2];
-	//w1 = training_batch[input_idx + 3];
-	//w2 = training_batch[input_idx + 4];
-	//w3 = training_batch[input_idx + 5];
 
 	faceId = *((uint32_t*)&training_batch[input_idx + 0]);
 	if (faceId < 0 || faceId >= n_faces) {
