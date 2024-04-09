@@ -83,20 +83,87 @@ __device__ T mapToBinCenter(T feature, int z, T s) {
 	return bin_center;
 }
 
+__device__ uint32_t featureHash(uint32_t faceId, uint32_t n_subdiv, uint32_t level, uint32_t W0, uint32_t W1, uint32_t W2, uint32_t max_features_level, uint32_t* offset, uint32_t* meta, tinyobj::index_t* indices, uint32_t n_vertices) {
+
+	uint32_t f_toHash = faceId;
+	uint32_t W0_toHash = W0;
+	uint32_t W1_toHash = W1;
+
+	// Feature at vertex
+	if (W0 == n_subdiv + 1 || W1 == n_subdiv + 1 || W2 == n_subdiv + 1) {
+		uint32_t v;
+		if (W0 == n_subdiv + 1) // at V0
+			v = indices[3 * faceId + 0].vertex_index;
+		else if (W1 == n_subdiv + 1) // at V1
+			v = indices[3 * faceId + 1].vertex_index;
+		else if (W2 == n_subdiv + 1) // at V2
+			v = indices[3 * faceId + 2].vertex_index;
+
+		for (size_t i = offset[v] + 1; i <= offset[v] + meta[offset[v]]; i++) {
+			f_toHash = min(f_toHash, meta[i]);
+		}
+		
+		W0_toHash = indices[3 * f_toHash + 0].vertex_index == v ? n_subdiv + 1 : 0;
+		W1_toHash = indices[3 * f_toHash + 1].vertex_index == v ? n_subdiv + 1 : 0;
+	}
+	
+	
+	// Feature on edge
+	else if (W0 == 0 || W1 == 0 || W2 == 0) {
+		uint32_t vmin, vmax, ind0, ind1;
+
+		if (W0 == 0) { // on edge (V1,V2)
+			ind0 = 1;
+			ind1 = 2;		
+		}
+		else if (W1 == 0) { // on edge (V0,V2)
+			ind0 = 0;
+			ind1 = 2;
+		}
+		else { // on edge (V0,V1)
+			ind0 = 0;
+			ind1 = 1;
+		}
+
+		vmin = min(indices[3 * faceId + ind0].vertex_index, indices[3 * faceId + ind1].vertex_index);
+		vmax = max(indices[3 * faceId + ind0].vertex_index, indices[3 * faceId + ind1].vertex_index);
+
+		for (size_t i = offset[vmin + n_vertices] + 1; i <= offset[vmin + n_vertices] + meta[offset[vmin + n_vertices]]; i += 3) {
+			if (meta[i] == vmax) {
+				f_toHash = min(meta[i + 1], meta[i + 2]) - n_vertices;
+			}
+		}
+
+		uint32_t Wind0 = ind0 == 0 ? W0 : (ind0 == 1 ? W1 : W2);
+		uint32_t Wind1 = ind1 == 0 ? W0 : (ind1 == 1 ? W1 : W2);
+
+		W0_toHash = indices[3 * f_toHash + 0].vertex_index == indices[3 * faceId + ind0].vertex_index ? Wind0
+			: (indices[3 * f_toHash + 0].vertex_index == indices[3 * faceId + ind1].vertex_index ? Wind1 : 0);
+
+		W1_toHash = indices[3 * f_toHash + 1].vertex_index == indices[3 * faceId + ind0].vertex_index ? Wind0
+			: (indices[3 * f_toHash + 1].vertex_index == indices[3 * faceId + ind1].vertex_index ? Wind1 : 0);
+	}
+
+	// Hash function
+	return (((5389456063u * level) ^ (2654435761u * f_toHash) ^ (805459861u * W1_toHash) ^ W0_toHash) % max_features_level) + level * max_features_level;
+}
+
 template <typename T>
-__device__ FeatureRef<T> computeFeatureRef(uint32_t faceId, T w0, T w1, T w2, uint32_t level, uint32_t* offset, uint32_t* meta) {
+__device__ FeatureRef<T> computeFeatureRef(uint32_t faceId, T w0, T w1, T w2, uint32_t max_features_level, uint32_t level, uint32_t* offset, uint32_t* meta, tinyobj::index_t* indices, uint32_t n_vertices) {
 
-	uint32_t face_stride = meta[0];
-	uint32_t level_offset = meta[1 + 2 * level];
-	uint32_t n_subdiv = meta[1 + 2 * level + 1];
 
-	// Compute 'barycentric' identifiers to feature vectors at adjacent vertices
+	uint32_t n_subdiv = (uint32_t)std::pow(2, level) - 1;
+
 	uint32_t w0_low = static_cast<uint32_t>(std::floorf((T)(n_subdiv + 1) * w0));
-	uint32_t w0_high = static_cast<uint32_t>(std::ceilf((T)(n_subdiv + 1) * w0));
+	w0_low = w0_low < 0 ? 0 : (n_subdiv < w0_low ? n_subdiv : w0_low);
+	uint32_t w0_high = w0_low + 1;
 	uint32_t w1_low = static_cast<uint32_t>(std::floorf((T)(n_subdiv + 1) * w1));
-	uint32_t w1_high = static_cast<uint32_t>(std::ceilf((T)(n_subdiv + 1) * w1));
+	w1_low = w1_low < 0 ? 0 : (n_subdiv < w1_low ? n_subdiv : w1_low);
+	uint32_t w1_high = w1_low + 1;
 	uint32_t w2_low = static_cast<uint32_t>(std::floorf((T)(n_subdiv + 1) * w2));
-	uint32_t w2_high = static_cast<uint32_t>(std::ceilf((T)(n_subdiv + 1) * w2));
+	w2_low = w2_low < 0 ? 0 : (n_subdiv < w2_low ? n_subdiv : w2_low);
+	uint32_t w2_high = w2_low + 1;
+
 
 	// adjacent 'sub-vertices' depend on if sub triangle is edge aligned to original triangle
 	uint32_t vertices_adj_local_aligned_unaligned[2][9] = { { w0_low, w1_high, w2_high, w0_high, w1_low, w2_high, w0_high, w1_high, w2_low },
@@ -111,17 +178,10 @@ __device__ FeatureRef<T> computeFeatureRef(uint32_t faceId, T w0, T w1, T w2, ui
 	*	- look up feature vector offset from precomputed buffer
 	*/
 	FeatureRef<T> result;
-	uint32_t invW0, W1;
 
-	invW0 = (n_subdiv + 1) - vertices_adj_local[0];
-	W1 = vertices_adj_local[1];
-	result.f0 = offset[faceId * face_stride + level_offset + (invW0 * (invW0 + 1) / 2 + W1)];
-	invW0 = (n_subdiv + 1) - vertices_adj_local[3];
-	W1 = vertices_adj_local[4];
-	result.f1 = offset[faceId * face_stride + level_offset + (invW0 * (invW0 + 1) / 2 + W1)];
-	invW0 = (n_subdiv + 1) - vertices_adj_local[6];
-	W1 = vertices_adj_local[7];
-	result.f2 = offset[faceId * face_stride + level_offset + (invW0 * (invW0 + 1) / 2 + W1)];
+	result.f0 = featureHash(faceId, n_subdiv, level, vertices_adj_local[0], vertices_adj_local[1], vertices_adj_local[2], max_features_level, offset, meta, indices, n_vertices);
+	result.f1 = featureHash(faceId, n_subdiv, level, vertices_adj_local[3], vertices_adj_local[4], vertices_adj_local[5], max_features_level, offset, meta, indices, n_vertices);
+	result.f2 = featureHash(faceId, n_subdiv, level, vertices_adj_local[6], vertices_adj_local[7], vertices_adj_local[8], max_features_level, offset, meta, indices, n_vertices);
 
 	// Compute local barycentric coordinates on sub triangle
 	T w0_local = (T)std::fmodf((T)(n_subdiv + 1) * w0, 1.0f);
@@ -141,8 +201,10 @@ __global__ void vertex_encoding(
 	const uint32_t n_features,
 	const uint32_t n_levels,
 	const uint32_t n_faces,
+	const uint32_t n_vertices,
 	const uint32_t output_width,
 	const uint32_t padded_output_width,
+	const uint32_t max_features_level,
 	tinyobj::index_t* indices,
 	T* features,
 	uint32_t* offset,
@@ -157,7 +219,7 @@ __global__ void vertex_encoding(
 	const uint32_t iter_count)
 {
 	const uint32_t encoded_index = blockIdx.x * blockDim.x + threadIdx.x;
-	const uint32_t level = blockIdx.y; // number of _added_ features per edge
+	const uint32_t level = blockIdx.y;
 
 	const uint32_t i = encoded_index / n_features;
 	const uint32_t j = encoded_index - i * n_features + level * n_features;
@@ -186,7 +248,7 @@ __global__ void vertex_encoding(
 	const T w2 = (T)1.0f - w0 - w1;
 
 	FeatureRef<T> fRef = computeFeatureRef(faceId,
-		w0, w1, w2, level, offset, meta);
+		w0, w1, w2, max_features_level, level, offset, meta, indices, n_vertices);
 
 	const bool fQuantEnable = n_quant_iterations > 0u;
 	const bool fQuantAddNoise = iter_count < n_quant_iterations;
@@ -230,6 +292,8 @@ __global__ void vertex_encoding_backward(
 	const uint32_t n_features,
 	const uint32_t n_levels,
 	const uint32_t n_faces,
+	const uint32_t n_vertices,
+	const uint32_t max_features_level,
 	tinyobj::index_t* indices,
 	T* features,
 	uint32_t* offset,
@@ -266,7 +330,7 @@ __global__ void vertex_encoding_backward(
 	T gradient;
 
 	FeatureRef<T> fRef = computeFeatureRef(faceId,
-		w0, w1, w2, level, offset, meta);
+		w0, w1, w2, max_features_level, level, offset, meta, indices, n_vertices);
 
 	gradient = dL_dy(j, i);
 	atomicAdd(&features[n_features * fRef.f0 + feature_entry], -gradient * fRef.w0);
@@ -300,7 +364,7 @@ template <typename T>
 class VertexEncoding : public Encoding<T> {
 public:
 	// TODO: remove n_faces parameter
-	VertexEncoding(uint32_t n_features, uint32_t n_levels, uint32_t n_dims_to_encode, uint32_t n_faces, uint32_t n_vertices, uint32_t max_features_per_level, uint32_t n_quant_bins, uint32_t n_quant_iterations, std::vector<tinyobj::index_t> indices)
+	VertexEncoding(uint32_t n_features, uint32_t n_levels, uint32_t n_dims_to_encode, uint32_t n_faces, uint32_t n_vertices, uint32_t max_features_per_level, uint32_t n_quant_bins, uint32_t n_quant_iterations, std::vector<tinyobj::index_t> indices, std::vector<uint32_t> offsets, std::vector<uint32_t> meta)
 		: m_n_features{ n_features }, m_n_levels{ n_levels }, m_n_dims_to_encode{ n_dims_to_encode }, m_n_faces{ n_faces }, m_n_vertices{ n_vertices }, m_max_features_per_level{ max_features_per_level }, m_n_bins{ n_quant_bins }, m_n_quant_iterations{ n_quant_iterations }
 	{
 		printf("Vertex Encoding: n_features = %i, n_levels = %i, max_fs_per_level = 2^%i\n", m_n_features, m_n_levels, (int)std::log2(m_max_features_per_level));
@@ -314,7 +378,13 @@ public:
 		m_indices = GPUMemory<tinyobj::index_t>(indices.size());
 		m_indices.copy_from_host(indices);
 
-		m_n_params = computeFeatureOffset(indices, &m_offset, &m_metadata) * n_features;
+		//m_n_params = computeFeatureOffset(indices, &m_offset, &m_metadata) * n_features;
+		m_n_params = m_n_levels * m_max_features_per_level * m_n_features;
+
+		m_offset = GPUMemory<uint32_t>(offsets.size());
+		m_offset.copy_from_host(offsets);
+		m_metadata = GPUMemory<uint32_t>(meta.size());
+		m_metadata.copy_from_host(meta);
 
 		// Feature Quantisation
 		m_z = (int)m_n_bins / 2;
@@ -326,6 +396,9 @@ public:
 
 	~VertexEncoding() {
 		cudaFree(m_crs);
+		m_indices.free_memory();
+		m_offset.free_memory();
+		m_metadata.free_memory();
 	}
 
 	std::unique_ptr<Context> forward_impl(
@@ -355,8 +428,10 @@ public:
 			m_n_features,
 			m_n_levels,
 			m_n_faces,
+			m_n_vertices,
 			m_n_output_dims,
 			padded_output_width(),
+			m_max_features_per_level,
 			m_indices.data(),
 			use_inference_params ? this->inference_params() : this->params(),
 			m_offset.data(),
@@ -404,6 +479,8 @@ public:
 			m_n_features,
 			m_n_levels,
 			m_n_faces,
+			m_n_vertices,
+			m_max_features_per_level,
 			m_indices.data(),
 			use_inference_params ? this->inference_params() : this->params(),
 			m_offset.data(),
@@ -701,9 +778,9 @@ private:
 };
 
 template <typename T>
-VertexEncoding<T>* create_vertex_encoding(uint32_t n_dims_to_encode, uint32_t n_vertices, uint32_t n_faces, std::vector<tinyobj::index_t> indices, std::vector<float> vertices, const json& encoding) {
+VertexEncoding<T>* create_vertex_encoding(uint32_t n_dims_to_encode, uint32_t n_vertices, uint32_t n_faces, std::vector<tinyobj::index_t> indices, std::vector<float> vertices, std::vector<uint32_t> offsets, std::vector<uint32_t> meta, const json& encoding) {
 
-	return new VertexEncoding<T>(encoding.value("n_features", 2u), encoding.value("n_levels", 1u), n_dims_to_encode, n_faces, n_vertices, encoding.value("max_features_level", 1u << 14), encoding.value("n_quant_bins", 16u), encoding.value("n_quant_iterations", 0u), indices);
+	return new VertexEncoding<T>(encoding.value("n_features", 2u), encoding.value("n_levels", 1u), n_dims_to_encode, n_faces, n_vertices, encoding.value("max_features_level", 1u << 14), encoding.value("n_quant_bins", 16u), encoding.value("n_quant_iterations", 0u), indices, offsets, meta);
 }
 
 }

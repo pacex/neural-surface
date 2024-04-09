@@ -329,7 +329,7 @@ std::vector<std::string> splitString(std::string input, char delimiter) {
 
 EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, std::vector<tinyobj::index_t> indices_host,
 	GPUMemory<float>* vertices, std::vector<float> vertices_host, GPUMemory<float>* texcoords, GPUMemory<float>* cdf,
-	GPUMemory<Material>* materials, GPUMemory<int>* material_ids,
+	GPUMemory<Material>* materials, GPUMemory<int>* material_ids, std::vector<uint32_t> offsets, std::vector<uint32_t> meta,
 	int sampleWidth, int sampleHeight, GPUMemory<float>* test_batch, long* training_time_ms,
 	uint32_t training_iterations) {
 	try {
@@ -367,7 +367,7 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 
 		std::shared_ptr<Loss<precision_t>> loss{ create_loss<precision_t>(loss_opts) };
 		std::shared_ptr<Optimizer<precision_t>> optimizer{ create_optimizer<precision_t>(optimizer_opts) };
-		std::shared_ptr<Encoding<precision_t>> encoding{ create_vertex_encoding<precision_t>(N_INPUT_DIMS, n_vertices, n_faces, indices_host, vertices_host, encoding_opts) };
+		std::shared_ptr<Encoding<precision_t>> encoding{ create_vertex_encoding<precision_t>(N_INPUT_DIMS, n_vertices, n_faces, indices_host, vertices_host, offsets, meta, encoding_opts) };
 		std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(encoding, N_OUTPUT_DIMS, network_opts);
 		//std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(std::shared_ptr<Encoding<precision_t>>{create_encoding<precision_t>(n_input_dims, encoding_opts)}, n_output_dims, network_opts);
 
@@ -550,7 +550,7 @@ int main(int argc, char* argv[]) {
 	std::string object_basedir = "data/objects/barramundifish/";
 	std::string object_path = object_basedir + "barramundifish.obj";
 	//std::string texture_path = object_basedir + "BarramundiFish_baseColor.png";
-	std::string sample_path = "data/objects/sample_fish_uv_2k.csv";
+	std::string sample_path = "data/objects/sample_fish.csv";
 
 
 	/* ======================
@@ -588,6 +588,7 @@ int main(int argc, char* argv[]) {
 	int n_indices = mesh.indices.size();
 	int n_faces = n_indices / 3;
 
+
 	// Generate histogram of face areas to sample surface points
 	std::vector<float> histogram(n_faces);
 	float area_sum = 0.f;
@@ -616,6 +617,88 @@ int main(int argc, char* argv[]) {
 		c_prob += histogram[i] / area_sum;
 		cdf_host[i] = c_prob;
 	}
+
+	// Compute vertex face list
+	std::vector<uint32_t> offsets_host(2 * n_vertices);
+	std::vector<uint32_t> meta_host;
+
+	std::vector<std::vector<uint32_t>> adjFaces(n_vertices);
+	std::vector<std::vector<uint32_t>> adjEdges(n_vertices);
+
+	for (uint32_t i = 0; i < n_faces; i++) {
+
+		uint32_t v0, v1, v2;
+		v0 = shapes[shapeIndex].mesh.indices[3 * i + 0].vertex_index;
+		v1 = shapes[shapeIndex].mesh.indices[3 * i + 1].vertex_index;
+		v2 = shapes[shapeIndex].mesh.indices[3 * i + 2].vertex_index;
+
+		adjFaces[v0].push_back(i);
+		adjFaces[v1].push_back(i);
+		adjFaces[v2].push_back(i);
+
+		uint32_t vmin, vmax;
+
+		vmin = min(v0, v1);
+		vmax = max(v0, v1);
+
+		auto it = adjEdges[vmin].empty() ? adjEdges[vmin].end() : std::find(adjEdges[vmin].begin(), adjEdges[vmin].end(), vmax);
+		if (it == adjEdges[vmin].end()) {
+			adjEdges[vmin].push_back(vmax);
+			adjEdges[vmin].push_back(n_vertices + i);
+			adjEdges[vmin].push_back(0xFFFFFFFF);
+		}
+		else {
+			auto ind = std::distance(adjEdges[vmin].begin(), it) + 2;
+			//adjEdges[vmin].at(ind) = i;
+			adjEdges[vmin][ind] = n_vertices + i;
+		}
+
+		vmin = min(v0, v2);
+		vmax = max(v0, v2);
+
+		it = adjEdges[vmin].empty() ? adjEdges[vmin].end() : std::find(adjEdges[vmin].begin(), adjEdges[vmin].end(), vmax);
+		if (it == adjEdges[vmin].end()) {
+			adjEdges[vmin].push_back(vmax);
+			adjEdges[vmin].push_back(n_vertices + i);
+			adjEdges[vmin].push_back(0xFFFFFFFF);
+		}
+		else {
+			auto ind = std::distance(adjEdges[vmin].begin(), it) + 2;
+			//adjEdges[vmin].at(ind) = i;
+			adjEdges[vmin][ind] = n_vertices + i;
+		}
+
+		vmin = min(v1, v2);
+		vmax = max(v1, v2);
+
+		it = adjEdges[vmin].empty() ? adjEdges[vmin].end() : std::find(adjEdges[vmin].begin(), adjEdges[vmin].end(), vmax);
+		if (it == adjEdges[vmin].end()) {
+			adjEdges[vmin].push_back(vmax);
+			adjEdges[vmin].push_back(n_vertices + i);
+			adjEdges[vmin].push_back(0xFFFFFFFF);
+		}
+		else {
+			auto ind = std::distance(adjEdges[vmin].begin(), it) + 2;
+			//adjEdges[vmin].at(ind) = i;
+			adjEdges[vmin][ind] = n_vertices + i;
+		}
+			
+
+		
+	}
+
+	for (size_t i = 0; i < n_vertices; i++) {
+		offsets_host[i] = meta_host.size();
+		meta_host.push_back(adjFaces[i].size());
+		meta_host.insert(meta_host.end(), adjFaces[i].begin(), adjFaces[i].end());
+	}
+
+	for (size_t i = 0; i < n_vertices; i++) {
+		offsets_host[n_vertices + i] = meta_host.size();
+		meta_host.push_back(adjEdges[i].size());
+		meta_host.insert(meta_host.end(), adjEdges[i].begin(), adjEdges[i].end());
+	}
+
 
 	// write vertices, indices and cdf to GPU memory
 	GPUMemory<float> vertices(n_vertices * 3);
@@ -648,11 +731,13 @@ int main(int argc, char* argv[]) {
 
 	materials.copy_from_host(materials_host);
 	material_ids.copy_from_host(mesh.material_ids);
+	std::cout << "Done." << std::endl;
 
 	/* =======================
 	*  === LOAD TEST INPUT ===
 	*  =======================
 	*/
+	
 	const bool testInput = true;
 
 	// Vector to store the floats
@@ -663,7 +748,7 @@ int main(int argc, char* argv[]) {
 	std::vector<float> surface_positions;
 
 	if (testInput) {
-
+		std::cout << "Loading " << sample_path << "..." << std::flush;
 		std::ifstream file(sample_path);
 
 		if (!file.is_open()) {
@@ -697,6 +782,7 @@ int main(int argc, char* argv[]) {
 
 		// Close the file
 		file.close();
+		std::cout << "Done." << std::endl;
 	}
 
 	// Write surface_positions to GPU memory
@@ -737,7 +823,7 @@ int main(int argc, char* argv[]) {
 
 		std::ofstream outCsv;
 		std::string csvFileName = fmt::format("evaluation_nbins{}_niter{}.csv", ns_bins[j], ns_iter[j] - 5000u);
-		csvFileName = "evaluation_moreChannels.csv";
+		//csvFileName = "evaluation_moreChannels.csv";
 		outCsv.open(csvFileName);
 		outCsv << "n_levels, n_features, max_fs_level, n_floats, loss, training_time_ms\n";
 
@@ -785,7 +871,7 @@ int main(int argc, char* argv[]) {
 
 		long training_time_ms;
 		EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf,
-			&materials, &material_ids, sampleWidth, sampleHeight, &test_batch, &training_time_ms, /*ns_iter[j]*/5000);
+			&materials, &material_ids, offsets_host, meta_host, sampleWidth, sampleHeight, &test_batch, &training_time_ms, /*ns_iter[j]*/5000);
 
 			outCsv << fmt::format("{},{},{},{},{},{}\n", ns_level[i], ns_feature[i], max_fs_level[i], res.n_floats, res.MSE, training_time_ms);
 		}
