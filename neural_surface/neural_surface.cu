@@ -104,12 +104,17 @@ __global__ void to_ldr(const uint64_t num_elements, const uint32_t n_channels, c
 	const uint64_t pixel = i / 4;
 	const uint32_t channel = i - pixel * 4;
 
+	if (mask[pixel * N_INPUT_DIMS + 1] < 0.0f || mask[pixel * N_INPUT_DIMS + 2] < 0.0f) {
+		out[i] = (uint8_t)0;
+		return;
+	}
+		
 	if (channel < n_channels)
 		out[i] = (uint8_t)(powf(fmaxf(fminf(in[pixel * stride + channel + offset], 1.0f), 0.0f), 1.0f / 2.2f) * 255.0f + 0.5f);
 	else if (channel < 3)
 		out[i] = (uint8_t)0;
 	else 
-		out[i] = (mask[pixel * N_INPUT_DIMS + 1] < 0.0f || mask[pixel * N_INPUT_DIMS + 2] < 0.0f) ? (uint8_t)0 : (uint8_t)255;
+		out[i] = (uint8_t)255;
 }
 
 template <typename T>
