@@ -589,6 +589,10 @@ private:
 
 	uint32_t computeFeatureOffset(std::vector<tinyobj::index_t> indices, GPUMemory<uint32_t>* offset, GPUMemory<uint32_t>* meta) {
 
+		/*
+			THIS METHOD IS NO LONGER USED
+		*/
+
 		/* Precompute offset of feature vectors in memory
 		*
 		* offset layout:

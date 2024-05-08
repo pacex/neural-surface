@@ -246,6 +246,10 @@ __global__ void generate_training_target(uint32_t n_elements, uint32_t n_faces, 
 		result[output_idx + 0] = 0.f;
 		result[output_idx + 1] = 0.f;
 		result[output_idx + 2] = 0.f;
+
+		result[output_idx + 3] = 0.f;
+		result[output_idx + 4] = 0.f;
+		result[output_idx + 5] = 0.f;
 		return;
 	}
 
@@ -309,7 +313,7 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 	GPUMemory<float>* vertices, std::vector<float> vertices_host, GPUMemory<float>* texcoords, GPUMemory<float>* cdf,
 	GPUMemory<Material>* materials, GPUMemory<int>* material_ids, std::vector<uint32_t> offsets, std::vector<uint32_t> meta,
 	int sampleWidth, int sampleHeight, GPUMemory<float>* test_batch, long* training_time_ms,
-	uint32_t training_iterations) {
+	uint32_t training_iterations, std::string image_fname) {
 	try {
 
 		EvalResult res;
@@ -435,10 +439,10 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 					res.EvalTime = evalTime;
 
 
-					auto filename = fmt::format("nl{}_nf{}_nmf{}_nbins{}_niter{}.png",
-						encoding_opts.value("n_levels", 1u), encoding_opts.value("n_features", 1u), std::log2(encoding_opts.value("max_features_level", 1u << 14)),
-						encoding_opts.value("n_quant_bins", 16u), training_iterations - 5000u);
-					save_images(prediction.data(), inference_batch.data(), sampleWidth, sampleHeight, filename);
+					//auto filename = fmt::format("nl{}_nf{}_nmf{}_nbins{}_niter{}.png",
+						//encoding_opts.value("n_levels", 1u), encoding_opts.value("n_features", 1u), std::log2(encoding_opts.value("max_features_level", 1u << 14)),
+						//encoding_opts.value("n_quant_bins", 16u), training_iterations - 5000u);
+					save_images(prediction.data(), inference_batch.data(), sampleWidth, sampleHeight, image_fname);
 				}
 
 				
@@ -527,10 +531,10 @@ int main(int argc, char* argv[]) {
 	*  =========================
 	*/
 
-	std::string object_basedir = "data/objects/barramundifish/";
-	std::string object_path = object_basedir + "barramundifish.obj";
+	std::string object_basedir = "data/objects/treestump/";
+	std::string object_path = object_basedir + "3DTreeStump001_HQ-4K-PNG.obj";
 	//std::string texture_path = object_basedir + "BarramundiFish_baseColor.png";
-	std::string sample_path = "data/objects/sample_fish.csv";
+	std::string sample_path = "data/objects/sample_treestump.csv";
 
 
 	/* ======================
@@ -777,7 +781,7 @@ int main(int argc, char* argv[]) {
 		GPUMatrix<float> test_generator_result(N_OUTPUT_DIMS, sampleWidth * sampleHeight);
 		linear_kernel(generate_training_target, 0, test_generator_stream, sampleWidth * sampleHeight, n_faces, materials.data(), material_ids.data(), test_generator_batch.data(), indices.data(), texcoords.data(), test_generator_result.data());
 
-		auto filename = "data_generator_test.png";
+		auto filename = "reference.png";
 		save_images(test_generator_result.data(), test_generator_batch.data(), sampleWidth, sampleHeight, filename);
 			
 	}
@@ -787,16 +791,17 @@ int main(int argc, char* argv[]) {
 		TRAINING AND EVALUATION
 	   =========================
 	*/
-
-	uint32_t n_test_cases = 28;
-	uint32_t ns_level[] = {   4,4,4,4,		5,5,5,5,	6,6,6,6,	7,7,7,7,	8,8,8,8,	6,6,6,6,	7,7,7,7 };
-	uint32_t ns_feature[] = { 1,2,4,8,		1,2,4,8,	1,2,4,8,	1,2,4,8,	1,2,4,8,	1,2,4,8,	1,2,4,8 };
 	/*
-	uint32_t n_test_cases = 40;
-	uint32_t ns_level[] = {		2, 3, 4, 5, 6, 7, 8, 9,		2, 3, 4, 5 ,6 ,7 ,8 ,9,			2, 3, 4, 5, 6, 7, 8, 9,		2, 3, 4, 5, 6, 7, 8, 9,		2, 3, 4, 5, 6, 7, 8, 9 };
-	uint32_t ns_feature[] = {	2, 2, 2, 2, 2, 2, 2, 2,		2, 2, 2, 2,	2, 2, 2, 2,			2, 2, 2, 2, 2, 2, 2, 2,		2, 2, 2, 2, 2, 2, 2, 2,		2, 2, 2, 2, 2, 2, 2, 2 };
-	uint32_t max_fs_level[] = { 18,18,18,18,18,18,18,18,	19,19,19,19,19,19,19,19,		20,20,20,20,20,20,20,20,	21,21,21,21,21,21,21,21,	22,22,22,22,22,22,22,22 };
+	uint32_t n_test_cases = 28;
+	uint32_t ns_level[] = {   4,4,4,4,		5,5,5,5,	6,6,6,6,	7,7,7,7,	8,8,8,8};
+	uint32_t ns_feature[] = { 1,2,4,8,		1,2,4,8,	1,2,4,8,	1,2,4,8,	1,2,4,8};
 	*/
+	
+	uint32_t n_test_cases = 3;
+	uint32_t ns_level[] = {		4, 4, 4,			4, 5,	6,	7, 8, 9 };
+	uint32_t ns_feature[] = {	2, 4, 8,			2, 2,	2,	2, 4, 4 };
+	uint32_t max_fs_level[] = { 21,21,21,			22,22,	22,	22,22,22};
+	
 	uint32_t ns_bins[] = { 32,32,64,16,			   32,32,32,32,			   64, 64, 64 , 64 };
 	uint32_t ns_iter[] = { 5250, 5250, 5250, 6000, 5250, 5500, 5750, 6000, 5250, 5500, 5750, 6000 };
 
@@ -836,7 +841,7 @@ int main(int argc, char* argv[]) {
 				{"otype", "Vertex"},
 				{"n_features", ns_feature[i]},
 				{"n_levels", ns_level[i]},
-				{"max_features_level", 1u << 20/*max_fs_level[i]*/},
+				{"max_features_level", 1u << /*20*/max_fs_level[i]},
 				{"n_quant_bins", ns_bins[j]},
 				{"n_quant_iterations", 0} //NoQuant
 			}},
@@ -851,10 +856,11 @@ int main(int argc, char* argv[]) {
 			};
 
 		long training_time_ms;
+		std::string image_fname = i == 0 ? "0mem.png" : (i == 1 ? "1bal.png" : "2qual.png");
 		EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf,
-			&materials, &material_ids, offsets_host, meta_host, sampleWidth, sampleHeight, &test_batch, &training_time_ms, /*ns_iter[j]*/5000);
+			&materials, &material_ids, offsets_host, meta_host, sampleWidth, sampleHeight, &test_batch, &training_time_ms, /*ns_iter[j]*/5000, image_fname);
 
-			outCsv << fmt::format("{},{},{},{},{},{},{}\n", ns_level[i], ns_feature[i], 20/*max_fs_level[i]*/, res.n_floats, res.MSE, training_time_ms, res.EvalTime);
+			outCsv << fmt::format("{},{},{},{},{},{},{}\n", ns_level[i], ns_feature[i], /*20*/max_fs_level[i], res.n_floats, res.MSE, training_time_ms, res.EvalTime);
 		}
 
 		outCsv.close();
