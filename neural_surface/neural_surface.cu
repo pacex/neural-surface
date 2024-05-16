@@ -22,10 +22,11 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-/** @file   mlp-learning-an-image.cu
- *  @author Thomas Müller, NVIDIA
- *  @brief  Sample application that uses the tiny cuda nn framework to learn a
-            2D function that represents an image.
+/** @file   neural_surface.cu
+ *  @author Thomas Müller, NVIDIA (original tiny-cuda-nn author)
+ *			Pascal Walloner, University of Gothenburg
+ *  @brief  Sample application that uses the tiny cuda nn framework and a custom input encoding
+ *			to map surface points on 3D meshes to their material properties.
  */
 
 #include <tiny-cuda-nn/common_device.h>
@@ -446,7 +447,7 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 					auto filename = fmt::format("nl{}_nf{}_nmf{}_nbins{}_niter{}.png",
 						encoding_opts.value("n_levels", 1u), encoding_opts.value("n_features", 1u), std::log2(encoding_opts.value("max_features_level", 1u << 14)),
 						encoding_opts.value("n_quant_bins", 16u), training_iterations - 5000u);
-					save_images(prediction.data(), inference_batch.data(), sampleWidth, sampleHeight, /*image_fname*/filename);
+					save_images(prediction.data(), inference_batch.data(), sampleWidth, sampleHeight, image_fname/*filename*/);
 				}
 			}
 
@@ -779,35 +780,9 @@ int main(int argc, char* argv[]) {
 		TRAINING AND EVALUATION
 	   =========================
 	*/
-	/*
-	uint32_t n_test_cases = 28;
-	uint32_t ns_level[] = {   4,4,4,4,		5,5,5,5,	6,6,6,6,	7,7,7,7,	8,8,8,8};
-	uint32_t ns_feature[] = { 1,2,4,8,		1,2,4,8,	1,2,4,8,	1,2,4,8,	1,2,4,8};
-	*/
 	
-	uint32_t n_test_cases = 5;
-	uint32_t ns_level[] = {		4, 4, 4, 4, 4,		4, 4, 4,		4, 4, 4, 4, 4, 4, 4, 4,		1, 2, 3, 4, 5, 6, 7, 8,		1, 2, 3, 4, 5, 6, 7, 8};
-	uint32_t ns_feature[] = {	8, 8, 8, 8, 8,		4, 4, 4,		4, 4, 4, 4, 4, 4, 4, 4,		4, 4, 4, 4, 4, 4, 4, 4,		8, 8, 8, 8, 8, 8, 8, 8};
-	uint32_t max_fs_level[] = { 20,20,20,20,20,		12,13,14,	15,16,17,18,19,20,21,22,	20,20,20,20,20,20,20,20,	20,20,20,20,20,20,20,20};
-	uint32_t ns_bins[] = {		16,32,64,128,256,			   32,32,32,32,			   64, 64, 64 , 64 };
 
-	uint32_t ns_iter[] = { 5250, 5250, 5250, 6000, 5250, 5500, 5750, 6000, 5250, 5500, 5750, 6000 };
-
-	for (size_t j = 0; j < 1; j++) {
-
-		std::ofstream outCsv;
-		std::string csvFileName = fmt::format("evaluation_nbins{}_niter{}.csv", ns_bins[j], ns_iter[j] - 5000u);
-		//csvFileName = "evaluation_moreChannels.csv";
-		outCsv.open(csvFileName);
-		outCsv << "n_levels, n_features, max_fs_level, n_floats, loss, training_time_ms, eval_time_micrs\n";
-
-		for (size_t i = 0; i < n_test_cases; i++) {
-
-			printf("============================\n");
-			printf("    TEST CASE %i / %i\n", i + 1, n_test_cases);
-			printf("============================\n");
-
-			json config = {
+	json config = {
 			{"loss", {
 				{"otype", "RelativeL2"}
 			}},
@@ -827,11 +802,11 @@ int main(int argc, char* argv[]) {
 			}},
 			{"encoding", {
 				{"otype", "Vertex"},
-				{"n_features", ns_feature[i]},
-				{"n_levels", ns_level[i]},
-				{"max_features_level", 1u << /*20*/max_fs_level[i]},
-				{"n_quant_bins", ns_bins[i]},
-				{"n_quant_iterations", 500} //NoQuant
+				{"n_features", 2},					// F
+				{"n_levels", 6},					// L
+				{"max_features_level", 1u << 21},	// T
+				{"n_quant_bins", 256},				// N
+				{"n_quant_iterations", 0}			// Additional training iterations after features are quantized, 0 = quantization disabled
 			}},
 			{"network", {
 				{"otype", "FullyFusedMLP"},
@@ -841,18 +816,19 @@ int main(int argc, char* argv[]) {
 				{"activation", "ReLU"},
 				{"output_activation", "None"},
 			}},
-			};
+	};
 
-		long training_time_ms;
-		std::string image_fname = i == 0 ? "0mem.png" : (i == 1 ? "1bal.png" : "2qual.png");
-		EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf,
-			&materials, &material_ids, offsets_host, meta_host, sampleWidth, sampleHeight, &test_batch, &training_time_ms, /*ns_iter[j]*/5500, image_fname);
+	long training_time_ms;
+	json encoding_opts = config.value("encoding", json::object());
+	std::cout << fmt::format("Starting training with hyperparameters:\nF = {} | L = {} | T = {} ...\n",
+		encoding_opts.value("n_features", 1u), encoding_opts.value("n_levels", 1u), encoding_opts.value("max_features_level", 1u));
 
-			outCsv << fmt::format("{},{},{},{},{},{},{}\n", ns_level[i], ns_feature[i], /*20*/max_fs_level[i], res.n_floats, res.MSE, training_time_ms, res.EvalTime);
-		}
+	EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf,
+		&materials, &material_ids, offsets_host, meta_host, sampleWidth, sampleHeight, &test_batch, &training_time_ms, 5000, "neural.png");
 
-		outCsv.close();
-	}
+	std::cout << fmt::format("Finished training after {} ms.\nMSE = {}\nEvaluation time = {} [microseconds]\n",
+		training_time_ms, res.MSE, res.EvalTime);
+
 
 	return EXIT_SUCCESS;
 }

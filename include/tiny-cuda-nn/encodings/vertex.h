@@ -22,9 +22,10 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-/** @file   frequency.h
- *  @author Thomas Müller, NVIDIA
- *  @brief  Implementation of the frequency encoding of NeRF [Mildenhall et al. 2020].
+/** @file   vertex.h
+ *  @author Thomas Müller, NVIDIA (original tiny cuda nn author)
+ *			Pascal Walloner, University of Gothenburg
+ *  @brief  Implementation of the geomatry-associated feature encoding for neural compression of surface properties of 3D meshes.
  */
 
 #pragma once
@@ -378,7 +379,6 @@ public:
 		m_indices = GPUMemory<tinyobj::index_t>(indices.size());
 		m_indices.copy_from_host(indices);
 
-		//m_n_params = computeFeatureOffset(indices, &m_offset, &m_metadata) * n_features;
 		m_n_params = m_n_levels * m_max_features_per_level * m_n_features;
 
 		m_offset = GPUMemory<uint32_t>(offsets.size());
@@ -586,199 +586,6 @@ private:
 
 		}
 	};
-
-	uint32_t computeFeatureOffset(std::vector<tinyobj::index_t> indices, GPUMemory<uint32_t>* offset, GPUMemory<uint32_t>* meta) {
-
-		/*
-			THIS METHOD IS NO LONGER USED
-		*/
-
-		/* Precompute offset of feature vectors in memory
-		*
-		* offset layout:
-		* |0		|face_stride	|2*face_stride	... |n_faces*face_stride	|
-		*			/				\
-		*			|f_00 f_01 f_02|f_10 f_11 ... f_1n_features_level|...
-		*
-		* (f_ij * n_features) serves as index to feature vector in params
-		*
-		* metadata layout:
-		* |face_stride level_offset_0 n_subdiv_0 level_offset_1 n_subdiv_1 ... level_offset_n-1 n_subdiv_n-1|
-		*
-		* returns number of unique feature vectors
-		*/
-
-		// TODO: make this hyperparam
-		auto level_subdiv = [](uint32_t l) {
-			return std::pow(2, l) - 1;
-		};
-
-	
-		uint32_t face_stride = 0; // How many feature offsets need to be stored per face
-		for (size_t l = 0; l < m_n_levels; l++) {
-			uint32_t n = level_subdiv(l);
-			face_stride += (n + 2) * (n + 3) / 2;
-		}
-
-		std::vector<uint32_t> offset_host(m_n_faces * face_stride);	// Offset buffer
-		std::vector<uint32_t> offset_hashed(m_n_faces * face_stride);
-		std::vector<uint32_t> meta_host(1 + m_n_levels * 2);		// Metadata buffer
-		meta_host[0] = face_stride;
-
-		uint32_t level_offset = 0;
-		uint32_t unique_feature = 0;	// Index of next unique feature vector
-
-		std::vector<uint32_t> n_unique_features_level(m_n_levels);
-
-
-		for (size_t l = 0; l < m_n_levels; l++) { // Iterate over subdivision levels, l=0: no subdivision
-
-			uint32_t n_subdiv = level_subdiv(l);
-			meta_host[1 + 2 * l] = level_offset;
-			meta_host[1 + 2 * l + 1] = n_subdiv;
-
-			uint32_t level_first_feature = unique_feature;
-
-
-			uint32_t n_features_level = (n_subdiv + 2) * (n_subdiv + 3) / 2; // #feature vectors per face on level l
-
-			// temp storage for indices to feature vectors that are shared across faces at vertices or along edges
-			std::vector<uint32_t> verts(m_n_vertices);
-			for (size_t i = 0; i < m_n_vertices; i++)
-				verts[i] = 0xffffffff;
-
-			std::vector<std::vector<Edge*>> edges(m_n_vertices);
-			for (size_t i = 0; i < m_n_vertices; i++)
-				edges[i] = std::vector<Edge*>();
-
-			for (size_t j = 0; j < m_n_faces; j++) { // At each level: Iterate over faces
-
-				uint32_t v0 = indices[3 * j + 0].vertex_index;
-				uint32_t v1 = indices[3 * j + 1].vertex_index;
-				uint32_t v2 = indices[3 * j + 2].vertex_index;
-
-				for (size_t f = 0; f < n_features_level; f++) { // For each face, at each subdivision level: iterate over all features within it
-
-					// Compute integer 'barycentric' feature identifiers
-					uint32_t invW0 = std::floorf(-0.5f + std::sqrtf(0.25f + 2 * f));
-					uint32_t W0 = (n_subdiv + 1) - invW0;
-					uint32_t W1 = f - (invW0 * (invW0 + 1) / 2);
-					uint32_t W2 = (n_subdiv + 1) - W0 - W1;
-					assert(W0 + W1 + W2 == (n_subdiv + 1));
-
-					// Shared feature at vertex
-					if (W0 == (n_subdiv + 1) || W1 == (n_subdiv + 1) || W2 == (n_subdiv + 1)) {
-						uint32_t v = W0 > 0 ? v0 : (W1 > 0 ? v1 : v2);
-						if (verts[v] == 0xffffffff) { // Not seen before -> assign new unique feature
-							offset_host[j * face_stride + level_offset + f] = unique_feature;
-							verts[v] = unique_feature;
-							unique_feature++;
-						}
-						else { // Seen before -> reference assigned feature
-							offset_host[j * face_stride + level_offset + f] = verts[v];
-						}
-					}
-
-					// Shared feature at edge
-					else if (W0 == 0 || W1 == 0 || W2 == 0) {
-						uint32_t e0 = W0 == 0 ? std::max(v1, v2) : (W1 == 0 ? std::max(v0, v2) : std::max(v0, v1));
-						uint32_t e1 = W0 == 0 ? std::min(v1, v2) : (W1 == 0 ? std::min(v0, v2) : std::min(v0, v1));
-						uint32_t W = e0 == v0 ? W0 : (e0 == v1 ? W1 : W2);
-
-						bool found = false;
-						for (size_t e = 0; e < edges[e0].size(); e++) {
-							Edge* candidate = edges[e0][e];
-							if (candidate->toVertex == e1 && candidate->subdiv == W - 1) {
-								// Seen before -> reference assigned feature
-								offset_host[j * face_stride + level_offset + f] = candidate->offset;
-								found = true;
-								break;
-							}
-						}
-						if (!found) {
-							// Not seen before -> assign new unique feature
-							offset_host[j * face_stride + level_offset + f] = unique_feature;
-							Edge* toE1 = new Edge(e1, W - 1, unique_feature);
-							edges[e0].push_back(toE1);
-							unique_feature++;
-						}
-
-						/*
-						if (edges[e0 * m_n_vertices * n_subdiv + e1 * n_subdiv + W - 1] == 0xffffffff) { // Not seen before -> assign new unique feature
-							offset_host[j * face_stride + level_offset + f] = unique_feature;
-							edges[e0 * m_n_vertices * n_subdiv + e1 * n_subdiv + W - 1] = unique_feature;
-							unique_feature++;
-						}
-						else { // Seen before -> reference assigned feature
-							offset_host[j * face_stride + level_offset + f] = edges[e0 * m_n_vertices * n_subdiv + e1 * n_subdiv + W - 1];
-						}*/
-					}
-
-					// Non-shared feature -> new unique feature
-					else {
-						offset_host[j * face_stride + level_offset + f] = unique_feature;
-						unique_feature++;
-					}
-
-					assert(level_offset + f < face_stride);
-				}
-			}
-
-			level_offset += n_features_level;
-
-			// Fix memory alignment
-			uint32_t alignment = 1u << 3;	// not 100% sure what the memory alignment requirements are but this seems to work
-			unique_feature += (alignment - (unique_feature % alignment)) % alignment;
-			n_unique_features_level[l] = unique_feature - level_first_feature;
-		}
-
-		// Hash offsets
-		level_offset = 0;
-		uint32_t hashed_unique_feature = 0;
-
-		for (size_t l = 0; l < m_n_levels; l++) { // Iterate over subdivision levels, l=0: no subdivision
-
-			uint32_t n_subdiv = level_subdiv(l);
-
-			uint32_t n_features_level = (n_subdiv + 2) * (n_subdiv + 3) / 2; // #feature vectors per face on level l
-
-			if (n_unique_features_level[l] <= m_max_features_per_level) {
-				for (size_t j = 0; j < m_n_faces; j++) { // At each level: Iterate over faces
-					for (size_t f = 0; f < n_features_level; f++) { // For each face, at each subdivision level: iterate over all features within it
-						offset_hashed[j * face_stride + level_offset + f] = offset_host[j * face_stride + level_offset + f];
-					}
-				}
-				hashed_unique_feature += n_unique_features_level[l];
-			}
-			else {
-				for (size_t j = 0; j < m_n_faces; j++) { // At each level: Iterate over faces
-					for (size_t f = 0; f < n_features_level; f++) { // For each face, at each subdivision level: iterate over all features within it
-						offset_hashed[j * face_stride + level_offset + f] =
-							hashOffset(offset_host[j * face_stride + level_offset + f]) + hashed_unique_feature;
-					}
-				}
-				hashed_unique_feature += m_max_features_per_level;
-			}
-
-			level_offset += n_features_level;
-		}
-
-		*offset = GPUMemory<uint32_t>(offset_hashed.size());
-		offset->copy_from_host(offset_hashed);
-		*meta = GPUMemory<uint32_t>(meta_host.size());
-		meta->copy_from_host(meta_host);
-
-		printf("n_unique_features = %i\n", hashed_unique_feature * m_n_features);
-		return hashed_unique_feature; // return #unique features
-		
-	}
-
-	uint32_t hashOffset(uint32_t offset) {
-
-		//const uint32_t big_prime = 2654435761u;
-		//return (offset * big_prime) % m_max_features_per_level;
-		return offset % m_max_features_per_level;
-	}
 };
 
 template <typename T>
