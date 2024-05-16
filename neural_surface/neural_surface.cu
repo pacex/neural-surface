@@ -84,6 +84,8 @@ struct EvalResult {
 
 
 #define N_INPUT_DIMS 3
+
+// Modify N_OUTPUT_DIMS to match the number of surface propertie channels that should be represented
 #define N_OUTPUT_DIMS 6
 
 GPUMemory<float> load_image(const std::string& filename, int& width, int& height) {
@@ -184,10 +186,11 @@ __global__ void generate_face_positions(uint32_t n_elements, uint32_t n_faces, c
 
 	int output_idx = idx * 3;
 
-	// Pick random face
+	// Pick random face uniformly
 	float r = fmodf(curand_uniform(&crs[idx]), 1.0f);
 
-	/* 
+	// Weigh faces by their relative area using precomputed CDF - unused
+	/*
 	uint32_t faceId = n_faces - 1;
 
 	for (uint32_t i = 0; i < n_faces; i++) {
@@ -268,7 +271,16 @@ __global__ void generate_training_target(uint32_t n_elements, uint32_t n_faces, 
 
 	vec2 uv_interp = w1 * uv1 + w2 * uv2 + w3 * uv3;
 
-	// This needs to match N_OUTPUT_DIMS
+
+	/*
+	*	Load sample reference textures to construct training target.
+	*
+	*	result[output_idx + {0 .. N_OUTPUT_DIMS}] corresponds to each of the N_OUTPUT_DIMS channels
+	*
+	*	Modify the following code to sample the correct textures.
+	*	Currently channels 0,1,2 represent albedo RGB (map_Kd) and channels 3,4,5 represent surface normals (map_Bump)
+	*	See Material Template Library for reference.
+	*/
 
 	if (materials[material_ids[faceId]].map_Kd.valid) {
 		cudaTextureObject_t texture_diffuse = materials[material_ids[faceId]].map_Kd.texture;
@@ -323,7 +335,7 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 		*  =======================
 		*/
 
-			// Various constants for the network and optimization
+		// Various constants for the network and optimization
 		const uint32_t batch_size = 1 << 18;
 
 		const uint32_t n_training_steps = training_iterations + 1;
@@ -351,8 +363,7 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 		std::shared_ptr<Optimizer<precision_t>> optimizer{ create_optimizer<precision_t>(optimizer_opts) };
 		std::shared_ptr<Encoding<precision_t>> encoding{ create_vertex_encoding<precision_t>(N_INPUT_DIMS, n_vertices, n_faces, indices_host, vertices_host, offsets, meta, encoding_opts) };
 		std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(encoding, N_OUTPUT_DIMS, network_opts);
-		//std::shared_ptr<NetworkWithInputEncoding<precision_t>> network = std::make_shared<NetworkWithInputEncoding<precision_t>>(std::shared_ptr<Encoding<precision_t>>{create_encoding<precision_t>(n_input_dims, encoding_opts)}, n_output_dims, network_opts);
-
+		
 		auto model = std::make_shared<Trainer<float, precision_t, precision_t>>(network, optimizer, loss);
 
 		std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
@@ -383,18 +394,14 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 			
 			// Generate Surface Points - training input
 			linear_kernel(generate_face_positions<precision_t>, 0, training_stream, batch_size, n_faces, crs, indices->data(), vertices->data(), cdf->data(), training_batch_raw.data());
-			//linear_kernel(rescale_faceIds, 0, training_stream, batch_size, n_faces, training_batch_raw.data(), training_batch.data());
 
-				// Sample reference texture at surface points - training output
-				linear_kernel(generate_training_target, 0, training_stream, batch_size, n_faces, materials->data(), material_ids->data(), training_batch_raw.data(), indices->data(), texcoords->data(), training_target.data());
+			// Sample reference texture at surface points - training output
+			linear_kernel(generate_training_target, 0, training_stream, batch_size, n_faces, materials->data(), material_ids->data(), training_batch_raw.data(), indices->data(), texcoords->data(), training_target.data());
 
 			/* =========================
 			*  === RUN TRAINING STEP ===
 			*  =========================
 			*/
-
-			
-			//auto ctx = trainer->training_step(training_stream, training_batch, training_target);
 
 			auto ctx_obj = model->training_step(training_stream, training_batch_raw, training_target);
 
@@ -403,9 +410,6 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 				++tmp_loss_counter;
 			}
 			
-
-
-
 
 			// Debug outputs
 			{
@@ -439,18 +443,10 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 					res.EvalTime = evalTime;
 
 
-					//auto filename = fmt::format("nl{}_nf{}_nmf{}_nbins{}_niter{}.png",
-						//encoding_opts.value("n_levels", 1u), encoding_opts.value("n_features", 1u), std::log2(encoding_opts.value("max_features_level", 1u << 14)),
-						//encoding_opts.value("n_quant_bins", 16u), training_iterations - 5000u);
-					save_images(prediction.data(), inference_batch.data(), sampleWidth, sampleHeight, image_fname);
-				}
-
-				
-
-				// Don't count visualizing as part of timing
-				// (assumes visualize_learned_pdf is only true when print_loss is true)
-				if (print_loss) {
-					//begin = std::chrono::steady_clock::now();
+					auto filename = fmt::format("nl{}_nf{}_nmf{}_nbins{}_niter{}.png",
+						encoding_opts.value("n_levels", 1u), encoding_opts.value("n_features", 1u), std::log2(encoding_opts.value("max_features_level", 1u << 14)),
+						encoding_opts.value("n_quant_bins", 16u), training_iterations - 5000u);
+					save_images(prediction.data(), inference_batch.data(), sampleWidth, sampleHeight, /*image_fname*/filename);
 				}
 			}
 
@@ -468,6 +464,7 @@ EvalResult trainAndEvaluate(json config, GPUMemory<tinyobj::index_t>* indices, s
 	}
 	catch (const std::exception& e) {
 		std::cout << "Uncaught exception: " << e.what() << std::endl;
+		exit(1);
 	}
 
 }
@@ -512,29 +509,20 @@ int main(int argc, char* argv[]) {
 			<< "This program was compiled for >=" << MIN_GPU_ARCH << " and may thus behave unexpectedly." << std::endl;
 	}
 
-	/*
-	if (argc < 2) {
-		std::cout << "USAGE: " << argv[0] << " " << "path-to-image.jpg [path-to-optional-config.json]" << std::endl;
-		std::cout << "Sample EXR files are provided in 'data/images'." << std::endl;
-		return 0;
-	}*/
+	if (argc != 4) {
+		std::cerr << "Usage: neural_surface <object_basedir> <object_filename> <sample_path>" << std::endl;
+		exit(1);
+	}
 
-	/*
-	if (argc >= 3) {
-		std::cout << "Loading custom json config '" << argv[2] << "'." << std::endl;
-		std::ifstream f{argv[2]};
-		config = json::parse(f, nullptr, true, /*skip_comments=*//*true);
-	}*/
 
 	/* =========================
 	*  === LAUNCH PARAMETERS ===
 	*  =========================
 	*/
 
-	std::string object_basedir = "data/objects/treestump/";
-	std::string object_path = object_basedir + "3DTreeStump001_HQ-4K-PNG.obj";
-	//std::string texture_path = object_basedir + "BarramundiFish_baseColor.png";
-	std::string sample_path = "data/objects/sample_treestump.csv";
+	std::string object_basedir = argv[1];
+	std::string object_path = object_basedir + argv[2];
+	std::string sample_path = argv[3];
 
 
 	/* ======================
@@ -797,12 +785,12 @@ int main(int argc, char* argv[]) {
 	uint32_t ns_feature[] = { 1,2,4,8,		1,2,4,8,	1,2,4,8,	1,2,4,8,	1,2,4,8};
 	*/
 	
-	uint32_t n_test_cases = 3;
-	uint32_t ns_level[] = {		4, 4, 4,			4, 5,	6,	7, 8, 9 };
-	uint32_t ns_feature[] = {	2, 4, 8,			2, 2,	2,	2, 4, 4 };
-	uint32_t max_fs_level[] = { 21,21,21,			22,22,	22,	22,22,22};
-	
-	uint32_t ns_bins[] = { 32,32,64,16,			   32,32,32,32,			   64, 64, 64 , 64 };
+	uint32_t n_test_cases = 5;
+	uint32_t ns_level[] = {		4, 4, 4, 4, 4,		4, 4, 4,		4, 4, 4, 4, 4, 4, 4, 4,		1, 2, 3, 4, 5, 6, 7, 8,		1, 2, 3, 4, 5, 6, 7, 8};
+	uint32_t ns_feature[] = {	8, 8, 8, 8, 8,		4, 4, 4,		4, 4, 4, 4, 4, 4, 4, 4,		4, 4, 4, 4, 4, 4, 4, 4,		8, 8, 8, 8, 8, 8, 8, 8};
+	uint32_t max_fs_level[] = { 20,20,20,20,20,		12,13,14,	15,16,17,18,19,20,21,22,	20,20,20,20,20,20,20,20,	20,20,20,20,20,20,20,20};
+	uint32_t ns_bins[] = {		16,32,64,128,256,			   32,32,32,32,			   64, 64, 64 , 64 };
+
 	uint32_t ns_iter[] = { 5250, 5250, 5250, 6000, 5250, 5500, 5750, 6000, 5250, 5500, 5750, 6000 };
 
 	for (size_t j = 0; j < 1; j++) {
@@ -842,8 +830,8 @@ int main(int argc, char* argv[]) {
 				{"n_features", ns_feature[i]},
 				{"n_levels", ns_level[i]},
 				{"max_features_level", 1u << /*20*/max_fs_level[i]},
-				{"n_quant_bins", ns_bins[j]},
-				{"n_quant_iterations", 0} //NoQuant
+				{"n_quant_bins", ns_bins[i]},
+				{"n_quant_iterations", 500} //NoQuant
 			}},
 			{"network", {
 				{"otype", "FullyFusedMLP"},
@@ -858,7 +846,7 @@ int main(int argc, char* argv[]) {
 		long training_time_ms;
 		std::string image_fname = i == 0 ? "0mem.png" : (i == 1 ? "1bal.png" : "2qual.png");
 		EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf,
-			&materials, &material_ids, offsets_host, meta_host, sampleWidth, sampleHeight, &test_batch, &training_time_ms, /*ns_iter[j]*/5000, image_fname);
+			&materials, &material_ids, offsets_host, meta_host, sampleWidth, sampleHeight, &test_batch, &training_time_ms, /*ns_iter[j]*/5500, image_fname);
 
 			outCsv << fmt::format("{},{},{},{},{},{},{}\n", ns_level[i], ns_feature[i], /*20*/max_fs_level[i], res.n_floats, res.MSE, training_time_ms, res.EvalTime);
 		}
