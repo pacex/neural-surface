@@ -804,9 +804,9 @@ int main(int argc, char* argv[]) {
 				{"otype", "Vertex"},
 				{"n_features", 2},					// F
 				{"n_levels", 6},					// L
-				{"max_features_level", 1u << 21},	// T
+				{"max_features_level", 1u << 19},	// T
 				{"n_quant_bins", 256},				// N
-				{"n_quant_iterations", 0}			// Additional training iterations after features are quantized, 0 = quantization disabled
+				{"n_quant_iterations", 0}			// Iterations after features are quantized, 0 = quantization disabled
 			}},
 			{"network", {
 				{"otype", "FullyFusedMLP"},
@@ -826,8 +826,8 @@ int main(int argc, char* argv[]) {
 	EvalResult res = trainAndEvaluate(config, &indices, indices_host, &vertices, attrib.vertices, &texcoords, &cdf,
 		&materials, &material_ids, offsets_host, meta_host, sampleWidth, sampleHeight, &test_batch, &training_time_ms, 5000, "neural.png");
 
-	std::cout << fmt::format("Finished training after {} ms.\nMSE = {}\nEvaluation time = {} [microseconds]\n",
-		training_time_ms, res.MSE, res.EvalTime);
+	std::cout << fmt::format("Finished training after {} ms.\nMSE = {}\nEvaluation time = {} [microseconds]\nn_params = {}\n",
+		training_time_ms, res.MSE, res.EvalTime, res.n_floats);
 
 
 	return EXIT_SUCCESS;
